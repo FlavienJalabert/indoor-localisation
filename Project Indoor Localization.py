@@ -106,11 +106,11 @@ print("Cleanup complete.")
 
 
 # --- Constants ---
-WINDOW_SIZE = 50
-EPOCHS = 100
+WINDOW_SIZE = 20 # number of points per sequence
+EPOCHS = 100 # max epochs to train sequential models
 PATIENCE = 10 # Number of epochs to wait for improvement before stopping
 ROLLING_WINDOW_SIZE = 10  # IMU temporal analysis
-results = []
+results = [] # Store results for each models
 
 # --- Data Loading and Preprocessing Functions ---
 
@@ -373,14 +373,12 @@ plt.show(block=False)
 imu_cols = [
     "AccelX", "AccelY", "AccelZ",
     "GyroX", "GyroY", "GyroZ",
+    "MagnetoX", "MagnetoY", "MagnetoZ"
 ]
-
-# Optionnel : magnétomètre s’il existe
-mag_cols = [c for c in ["MagnetoX", "MagnetoY", "MagnetoZ"] if c in df.columns]
 
 target_cols = ["label_X", "label_Y"]
 
-corr_cols = imu_cols + mag_cols + target_cols
+corr_cols = imu_cols + target_cols
 corr_df = df[corr_cols].corr()
 
 plt.figure(figsize=(10, 6))
@@ -586,7 +584,7 @@ plt.scatter(y_pred_lr[:,0], y_pred_lr[:,1],
             s=5, alpha=0.5, label="Prédictions")
 
 plt.legend()
-plt.title("Vérités terrain vs Prédictions – Régression Linéaire")
+plt.title("Vérités terrain vs Prédictions - Régression Linéaire")
 plt.xlabel("X")
 plt.ylabel("Y")
 plt.axis("equal")
@@ -648,7 +646,7 @@ def evaluate_regression(y_true, y_pred, name="model"):
     r99 = np.percentile(err, 99)
 
     # scores de couverture : P(error < seuil)
-    thresholds = [0.25, 0.5, 1.0, 2.0]          # à ajuster selon ton cahier des charges
+    thresholds = [0.25, 0.5, 1.0, 2.0]          # à ajuster selon le cahier des charges
     cov = {f"p_err_lt_{t}m": float(np.mean(err <= t)) for t in thresholds}
 
     # erreur max + n (utile pour voir les outliers)
@@ -691,9 +689,9 @@ def feature_engineering_best(
     imu_cols=("AccelX","AccelY","AccelZ","GyroX","GyroY","GyroZ","MagnetoX","MagnetoY","MagnetoZ"),
     time_col="t_ms",
 
-    # Rolling features (INTÉGRÉ)
-    add_rolling=True,                  # calcule et ajoute les *_roll_*
-    rolling_window_size=25,            # ROLLING_WINDOW_SIZE
+    # Rolling features
+    add_rolling=True,                                   # calcule et ajoute les features *_roll_*
+    rolling_window_size=ROLLING_WINDOW_SIZE,            # ROLLING_WINDOW_SIZE
     rolling_group_cols=("device","motion"),
     rolling_imu_cols=("AccelX","AccelY","AccelZ","GyroX","GyroY","GyroZ"),
     rolling_stats=("mean","var","min","max"),
@@ -888,6 +886,7 @@ def feature_engineering_best(
         "rolling_group_cols": rolling_group_cols,
     }
 
+    # logging for debug
     if verbose:
         print(f"[FE] IMU cols: {len(imu_cols)} | deriv: {len(deriv_cols)} | roll: {len(roll_cols)} (created={len(roll_cols)})")
         print(f"[FE] Wi-Fi all: {len(wifi_all_cols)} | topK: {len(topk_wifi_cols)} (K={wifi_topk})")
@@ -1086,7 +1085,7 @@ def build_sequences(
     """
     Construit des séquences de longueur window_size.
     Si session_col est donné, on ne fait pas de séquence qui traverse deux sessions différentes
-    (ex: fichier, trajectoire, device+motion, etc.)
+    (ex: device+motion, etc.)
     """
     X_seqs = []
     y_seqs = []
@@ -1139,7 +1138,7 @@ class TrajDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 # ------------------------------------------------------------
-# Préparation LSTM/GRU PROPRE (split par sessions, OHE aligné, scaler fit train)
+# Préparation LSTM/GRU (split par sessions, OHE aligné, scaler fit train)
 # Prérequis : feature_engineering_best(...) et build_sequences(...) existent.
 # df_trimmed contient : device, motion, label_X, label_Y, t_ms (+ capteurs/wifi bruts)
 # ------------------------------------------------------------
@@ -1261,8 +1260,7 @@ Xte_flat_scaled = scaler_lstm_gru.transform(Xte_flat)
 X_test_scaled = Xte_flat_scaled.reshape(Nte, T, D)
 
 # 7) Split validation à l'intérieur du train (pas toucher au test)
-# Option simple (OK pour commencer). Option M2 stricte: val split aussi par sessions au niveau séquence.
-from sklearn.model_selection import train_test_split
+# Option simple : split sans session au niveau de sequence.
 X_train_lstm_fe, X_val_lstm_fe, y_train_lstm_fe, y_val_lstm_fe = train_test_split(
     X_train_scaled, y_train_seqs, test_size=0.2, random_state=42
 )
@@ -1302,7 +1300,7 @@ class LSTMRegressorDiamond(nn.Module):
             dropout=dropout_lstm if num_layers > 1 else 0.0,
         )
 
-        # Tête MLP en forme de diamant : X -> 64 -> 32 -> 16 -> Y (2)
+        # Tête MLP en forme de diamant : X(64) -> 128 -> 64 -> 32 -> 16 -> Y(2)
         self.fc = nn.Sequential(
             nn.Linear(hidden_dim, 128),
             nn.ReLU(),
@@ -1413,7 +1411,7 @@ for epoch in range(EPOCHS):
         BEST_VAL_LOSS = val_loss
         epochs_no_improve = 0
         # Optionally save the best model
-        # torch.save(modelLSTM_fe.state_dict(), 'best_lstm_fe.pth')
+        torch.save(modelLSTM_fe.state_dict(), 'best_lstm_fe.pth')
     else:
         epochs_no_improve += 1
         if epochs_no_improve == PATIENCE:
@@ -1470,14 +1468,14 @@ criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(modelGRU_fe.parameters(), lr=5e-4)
 
 # %%
-print("\n--- Training GRU with Refined Features ---")
-
-epochs_no_improve = 0
 BEST_VAL_LOSS = float('inf')
+epochs_no_improve = 0
+
+print("\n--- Training GRU with Refined Features ---")
 for epoch in range(EPOCHS):
     modelGRU_fe.train()
     train_loss = 0.0
-    for X_batch, y_batch in train_loader_fe: # Use the new feature-engineered train_loader
+    for X_batch, y_batch in train_loader_fe:
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
 
@@ -1491,24 +1489,33 @@ for epoch in range(EPOCHS):
 
     train_loss /= len(train_ds_fe)
 
-    # Éval rapide sur test
+    # Validation step
     modelGRU_fe.eval()
-    test_loss = 0.0
+    val_loss = 0.0
     with torch.no_grad():
-        for X_batch, y_batch in test_loader_fe:
+        for X_batch, y_batch in val_loader_fe:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
             y_pred = modelGRU_fe(X_batch)
             loss = criterion(y_pred, y_batch)
-            test_loss += loss.item() * X_batch.size(0)
-    test_loss /= len(test_ds_fe)
+            val_loss += loss.item() * X_batch.size(0)
+    val_loss /= len(val_ds_fe)
 
-    print(f"Epoch {epoch+1}/{EPOCHS}  train_loss={train_loss:.4f}  test_loss={test_loss:.4f}")
+    print(f"Epoch {epoch+1}/{EPOCHS}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
 
-    if (train_loss <= 0.01):
-      break
+    # Early stopping check
+    if val_loss < BEST_VAL_LOSS:
+        BEST_VAL_LOSS = val_loss
+        epochs_no_improve = 0
+        # Optionally save the best model
+        torch.save(modelGRU_fe.state_dict(), 'best_gru_fe.pth')
+    else:
+        epochs_no_improve += 1
+        if epochs_no_improve == PATIENCE:
+            print(f"Early stopping triggered after {PATIENCE} epochs without improvement.")
+            break
 
-print("Fitting finished")
+print("GRU Fitting finished")
 
 # %%
 modelGRU_fe.eval()
@@ -1516,7 +1523,7 @@ all_true_GRU_fe = []
 all_pred_GRU_fe = []
 
 with torch.no_grad():
-    for X_batch, y_batch in test_loader_fe: # Use the new feature-engineered test_loader
+    for X_batch, y_batch in test_loader_fe:
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
         y_pred = modelGRU_fe(X_batch)
@@ -1731,8 +1738,6 @@ def session_analysis_device_motion(
         sid = row["session_id"]
         sess_rows = session_df_long[session_df_long["session_id"] == sid].copy()
 
-        # plot_error_cdf attend ton results_df (avec errors_radial_m)
-        # Assure-toi que evaluate_regression ajoute bien "errors_radial_m"
         plot_error_cdf(
             sess_rows,
             title=f"CDF erreurs — session {sid}",
@@ -1928,6 +1933,7 @@ X_fe = pd.concat([X_fe_num, df_fe[["device","motion"]]], axis=1)
 # colonnes exactes attendues par le pipeline (= num + cat)
 train_cols_pipeline = list(X_fe.columns)
 
+# 1) sélectionner une session et créer le DF en conséquence
 device_sel, motion_sel = pick_session(df_fe)
 df_s, X_s = get_session_df(df_fe, X_fe, device_sel, motion_sel)
 
@@ -1951,8 +1957,6 @@ df_s_ohe = pd.get_dummies(df_s_ohe, columns=["device","motion"], drop_first=True
 
 
 # 2) aligner EXACTEMENT les colonnes attendues (celles du training)
-# tu dois avoir sauvegardé cette liste au moment du training :
-# feature_cols_lstm_gru = [...]
 missing = set(feature_cols_lstm_gru) - set(df_s_ohe.columns)
 extra   = set(df_s_ohe.columns) - set(feature_cols_lstm_gru) - {"label_X","label_Y"}
 
@@ -1986,13 +1990,13 @@ y_pred_gru, y_true_seq, idx_seq = predict_gru_on_session(
 )
 
 # %%
-# alignement temporel
+# alignement temporel across model
 y_true_aligned = y_true[idx_seq]
 y_pred_knn_aligned = y_pred_knn_fe[idx_seq]
 y_pred_rf_aligned = y_pred_rf_fe[idx_seq]
 y_pred_xgb_aligned = y_pred_xgb_fe[idx_seq]
 
-# Performance sur la trajectoire
+# Performances sur la trajectoire
 radar_metrics = [
     "rmse_2d_m",
     "median_err_m",
