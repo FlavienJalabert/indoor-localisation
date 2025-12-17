@@ -1,26 +1,33 @@
 # %% [markdown]
-# # Indoor Localization using IMU and Wi-Fi Data
+# # Localisation Indoor (IMU + Wi‑Fi) — Rapport technique
 # 
-# ## Introduction and Problem Statement
+# Ce notebook présente un pipeline reproductible pour estimer une position 2D (X,Y) à partir de capteurs inertiels (IMU) et de mesures Wi‑Fi (RSSI).
 # 
-# This notebook explores various machine learning techniques for indoor localization, a critical task with applications ranging from asset tracking to emergency services. Unlike outdoor environments where GPS is widely available, accurate indoor positioning remains a significant challenge due to signal attenuation, multipath effects, and non-line-of-sight conditions. This study focuses on leveraging two primary data sources: Inertial Measurement Units (IMUs) and Wi-Fi signal strengths (RSSI).
+# Objectifs du projet
+# - Concevoir un pipeline complet : import, nettoyage, densification des labels, feature engineering, entraînement et évaluation.
+# - Comparer approches pointwise (kNN, RandomForest, XGBoost) et séquentielles (LSTM, GRU) en s'assurant d'absence de fuite d'information.
+# - Proposer et appliquer des métriques pertinentes pour la localisation (erreur radiale, percentiles p68/p90/p95, CDF) et une analyse par session (device/motion).
 # 
-# IMUs provide motion-related data such as acceleration and angular velocity, which can be integrated to estimate position (dead reckoning). However, IMU data suffers from drift over time, leading to cumulative errors. Wi-Fi RSSI, on the other hand, offers a complementary source of information by providing a unique 'fingerprint' for different locations within an indoor environment. The combination of these two modalities can provide a more robust and accurate localization solution.
+# Jeu de données et contraintes
+# - Données multi‑fichiers (ESP32, Samsung), trajectoires variées (horizontal, vertical, square...).
+# - Labels ponctuels interpolés (densification linéaire) — contrôler la qualité des anchors vs densified.
+# - Forte proportion de NaN sur colonnes Wi‑Fi → sélection top‑K AP requise.
 # 
-# ### Objective
-# 
-# The main objective of this study is to develop and compare different regression models to predict the 2D (X, Y) position of a device within an indoor setting. We will investigate the performance of both traditional (Linear Regression, Random Forest, XGBoost) and sequential (LSTM, GRU) models, assess the impact of feature engineering on their accuracy, and identify the most effective approach for indoor localization using the provided sensor data.
+# Organisation
+# 1) Import & EDA — exploration et vérifications
+# 2) Prétraitement — filtrage colonnes, timestamp, imputation
+# 3) Feature engineering — rolling IMU, dérivées, sélection Wi‑Fi top‑K
+# 4) Modèles tabulaires & séquentiels — entrainement et évaluation
+# 5) Analyse par trajectoire, synthèse et recommandations
 
 # %% [markdown]
-# # Etape 1 : importer et explorer les données
-
-# %% [markdown]
-# ## Import datas and create dataframe
-# densify data with labels and metadata
+# ## Étape 1 — Importation et exploration des données
+# 
+# Cette section rassemble le nettoyage des runs précédentes, l'import des fichiers CSV et la consolidation en un DataFrame unifié.
 
 # %%
 # ============================================================
-# SYSTÈME & UTILITAIRES
+# SYSTEM & UTILITIES
 # ============================================================
 import os
 import shutil
@@ -31,7 +38,7 @@ from math import pi
 
 
 # ============================================================
-# RÉSEAU & MANIPULATION DE DONNÉES
+# NETWORK & DATA MANIPULATION
 # ============================================================
 import requests
 import pandas as pd
@@ -39,7 +46,7 @@ import numpy as np
 
 
 # ============================================================
-# VISUALISATION
+# VISUALIZATION
 # ============================================================
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -54,6 +61,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.base import clone
 
 # Modèles
 from sklearn.linear_model import LinearRegression
@@ -74,45 +82,52 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# 1. Remove the files named `dataset_*.csv`
+# Nettoyage des artefacts de runs précédents : suppression des fichiers temporaires générés
 if os.path.exists("dataset_trimmed_densified.csv"):
     os.remove("dataset_trimmed_densified.csv")
-    print("Removed dataset_trimmed_densified.csv")
+    print("Removed: dataset_trimmed_densified.csv")
 if os.path.exists("dataset_trimmed.csv"):
     os.remove("dataset_trimmed.csv")
-    print("Removed dataset_trimmed.csv")
+    print("Removed: dataset_trimmed.csv")
 
 # 2. Remove the file named `y_targets.csv`
 if os.path.exists("y_targets.csv"):
     os.remove("y_targets.csv")
-    print("Removed y_targets.csv")
+    print("Removed: y_targets.csv")
 
 # 3. Remove the file named `X_preprocessed.csv`
 if os.path.exists("X_preprocessed.csv"):
     os.remove("X_preprocessed.csv")
-    print("Removed X_preprocessed.csv")
+    print("Removed: X_preprocessed.csv")
 
 # 4. Remove the file named `X_feature_engineered.csv`
 if os.path.exists("X_feature_engineered.csv"):
     os.remove("X_feature_engineered.csv")
-    print("Removed X_feature_engineered.csv")
+    print("Removed: X_feature_engineered.csv")
 
 # 5. Remove the directory named `csv_from_uncloud` and all its contents.
 if os.path.exists("csv_from_uncloud"):
     shutil.rmtree("csv_from_uncloud")
-    print("Removed directory csv_from_uncloud")
+    print("Removed: csv_from_uncloud")
 
-print("Cleanup complete.")
+print("Initial cleanup complete.")
 
+# %% [markdown]
+# ### Jeu de données — détails d'acquisition  
+# - Sources : acquisitions multi‑fichiers (ESP32 / Samsung, différents parcours : horizontal, vertical, carré, combiné).  
+# - Capteurs : Accéléromètre, Gyroscope, Magnétomètre, mesures Wi‑Fi (RSSI par point d'accès).  
+# - Labels : positions ponctuelles (X,Y) présentes périodiquement → interpolation spatiale pour densifier (label_X,label_Y).  
+# - Remarques : présence importante de NaN sur certaines colonnes Wi‑Fi, nécessité d'une sélection robuste d'APs (top‑k).
 
-# --- Constants ---
-WINDOW_SIZE = 20 # number of points per sequence
-EPOCHS = 100 # max epochs to train sequential models
-PATIENCE = 10 # Number of epochs to wait for improvement before stopping
-ROLLING_WINDOW_SIZE = 10  # IMU temporal analysis
-results = [] # Store results for each models
+# %%
+# Constantes (paramètres réutilisés dans le pipeline)
+WINDOW_SIZE = 20           # taille de la fenêtre pour les modèles séquentiels
+EPOCHS = 100               # nombre max d'époques pour l'entraînement
+PATIENCE = 20              # patience pour early stopping
+ROLLING_WINDOW_SIZE = 10   # fenêtre rolling pour features IMU
+results = []               # stockage des métriques par modèle
 
-# --- Data Loading and Preprocessing Functions ---
+# --- Fonctions de téléchargement et extraction ---
 
 def download_zip(url: str) -> bytes:
     """Télécharge le ZIP depuis l'URL et renvoie son contenu en bytes."""
@@ -143,6 +158,8 @@ def load_csvs_to_dataframes(csv_paths):
         name_no_ext = os.path.splitext(os.path.basename(path))[0]
         dfs[name_no_ext] = pd.read_csv(path)
     return dfs
+
+# --- Fonctions principales de traitement ---
 
 def infer_device_and_motion(filename: str):
     """
@@ -266,7 +283,7 @@ def densify_spatial_labels(df: pd.DataFrame) -> pd.DataFrame:
 def timestamp_to_ms(s: pd.Series) -> pd.Series:
     parts = s.astype(str).str.split(":", expand=True)
     if parts.shape[1] != 4:
-        raise ValueError("Timestamp doit être au format HH:MM:SS:xx (ex: 17:24:20:16)")
+        raise ValueError("Timestamp must be in format HH:MM:SS:xx (e.g. 17:24:20:16)")
     hh = pd.to_numeric(parts[0], errors="coerce")
     mm = pd.to_numeric(parts[1], errors="coerce")
     ss = pd.to_numeric(parts[2], errors="coerce")
@@ -306,7 +323,17 @@ if not os.path.exists("csv_from_uncloud"):
     print(f"[+] Initial combined DataFrame shape: {df.shape}")
 
 # %% [markdown]
-# ## Visualyze and understand dataset
+# ## Analyse exploratoire (EDA) — buts et points de contrôle
+# 
+# Buts :
+# - Vérifier la couverture spatiale des trajectoires et repérer sessions dominantes qui pourraient biaiser l'évaluation.
+# - Evaluer la présence et la variance des AP Wi‑Fi pour sélectionner un sous‑ensemble informatif (top‑K).
+# - Rechercher corrélations éventuelles IMU ↔ positions (diagnostic de features utiles).
+# 
+# Points de contrôle à réaliser après exécution :
+# - Visualiser anchors vs labels densifiés pour 5 trajectoires aléatoires.
+# - Examiner la distribution de t_ms (dt médian, outliers) par session.
+# - Construire un tableau AP (presence, variance) et valider le seuil de présence minimal utilisé en FE.
 
 # %%
 print("\n===============================")
@@ -366,9 +393,6 @@ plt.grid(True)
 plt.colorbar(label="RefP")
 plt.show(block=False)
 
-# %% [markdown]
-# ## EDA
-
 # %%
 imu_cols = [
     "AccelX", "AccelY", "AccelZ",
@@ -394,10 +418,6 @@ sns.heatmap(
 plt.title("Correlation heatmap — IMU / Magneto vs Position labels")
 plt.tight_layout()
 plt.show(block=False)
-
-
-# %% [markdown]
-# correlation forte entre magnetoY et labelX
 
 # %%
 wifi_cols = [c for c in df.columns if any(
@@ -453,12 +473,18 @@ plt.title("Wi-Fi Auto-correlation (top variance APs)")
 plt.tight_layout()
 plt.show(block=False)
 
-
 # %% [markdown]
-# Très bonne méthode d'utiliser les réseaux Wi-Fi pour déterminer les positions
-
-# %% [markdown]
-# ## Pre processing
+# ## Prétraitement — résumé opérationnel
+# 
+# Étapes réalisées (implémentées dans le code) :
+# - Suppression des colonnes très partiellement renseignées (>56% NaN).
+# - Suppression des lignes sans labels (label_X, label_Y).
+# - Conversion Timestamp → t_ms et imputation robuste (médiane pour capteurs; RSSI traité plus tard).
+# - Remplacement des valeurs manquantes pour Magneto* par la médiane par colonne.
+# 
+# Raisonnement et risques :
+# - Densification linéaire des labels est simple et permet d'obtenir des cibles pour l'entraînement, mais peut introduire un biais sur trajectoires courbes → vérifier visuellement.
+# - Imputation par médiane stabilise les features IMU mais atténue la variabilité ; conserver diagnostics (variance avant/après).
 
 # %%
 print("Shape initiale :", df.shape)
@@ -482,11 +508,12 @@ meta = df_trimmed[["device", "label_X", "label_Y"]].reset_index(drop=True)
 # 3) on uniformise le vecteur temps pour plus tard
 df_trimmed["t_ms"] = timestamp_to_ms(df_trimmed["Timestamp"])
 
-# 3) on enlève tout ce qui est non utile
+# 3) on enlève tout ce qui est non utile / redondant / lakeage
 cols_to_drop = [
     "Index", # doesn't give any informations
     "Timestamp", # new t_ms better
     "vX", "Orientation", "vY" # Always 0.0
+    "RefP" # leakage
 ]
 
 df_trimmed = df_trimmed.drop(columns=[c for c in cols_to_drop if c in df_trimmed.columns])
@@ -533,10 +560,9 @@ print(" - X_preprocessed.csv")
 print(" - y_targets.csv")
 
 # %% [markdown]
-# ## Regression linéaire
-
-# %% [markdown]
-# ### Baseline (Linear Regression)
+# ### Régression linéaire
+# 
+# Modèle de base pour évaluer la complexité ajoutée par rapport à un modèle linéaire simple.
 
 # %%
 X_train, X_test, y_train, y_test_raw, meta_train, meta_test = train_test_split(
@@ -570,7 +596,7 @@ y_pred_lr = linreg.predict(X_test)
 
 # %%
 # Analyse des résultats de la baseline
-print("=== Linear Regression ===")
+print("=== Régression Linéaire ===")
 errors = np.linalg.norm(y_test_raw.values - y_pred_lr, axis=1)
 
 print("Erreur moyenne (m) :", errors.mean())
@@ -595,20 +621,49 @@ plt.show(block=False)
 # Grâce à ce premier test, nous savons que le problème n'est pas linéaire et que les données brutes ne seront pas suffisantes pour ce genre d'analyse.
 
 # %% [markdown]
-# # Etape 2 : Raffiner les données et entrainer  des modèles de regression tabulaire et séquentiels
-
-# %% [markdown]
-# ## Feature Engineering
+# ## Feature engineering — Objectifs
+# 
+# Le feature engineering a pour objectif de transformer les signaux bruts (WiFi et capteurs inertiels) en des représentations exploitables par les modèles d’apprentissage, tout en limitant le bruit et les risques de fuite de données.
+# 
+# Les transformations appliquées visent à améliorer la stabilité des modèles et leur capacité de généralisation, sans introduire de contraintes spatiales explicites.
+# 
+# ---
+# 
+# ### Signaux WiFi
+# 
+# Les traitements appliqués incluent :
+# - la sélection d’un sous-ensemble de points d’accès (top-k) afin de réduire la dimension et la sparsité,
+# - l’encodage des niveaux RSSI et de la présence des points d’accès,
+# - la suppression des signaux peu fréquents,
+# - la normalisation des variables numériques.
+# 
+# Ces traitements visent à conserver les signatures spatiales dominantes du WiFi tout en réduisant la variabilité instantanée du signal.
+# 
+# ---
+# 
+# ### Capteurs inertiels
+# 
+# Les signaux inertiels sont utilisés sous forme brute, complétés par :
+# - des dérivées temporelles simples,
+# - des statistiques glissantes (moyenne et écart-type).
+# 
+# Ces transformations apportent une information dynamique locale sur le mouvement, sans recourir à une intégration explicite (vitesse ou position), afin de limiter l’accumulation d’erreurs.
+# 
+# ---
+# 
+# ### Variables contextuelles
+# 
+# Les variables contextuelles, telles que le type de mouvement (`motion`), sont encodées par one-hot encoding.  
+# Le champ `device` est contrôlé ou exclu lors des tests cross-device afin d’éviter toute information non disponible en situation réelle.
+# 
 
 # %%
-# --- Evaluation Metrics Functions ---
-
+# --- Fonctions d'évaluation : métriques adaptées à la localisation 2D ---
 def evaluate_regression(y_true, y_pred, name="model"):
     """
-    Métriques utiles pour localisation 2D.
-    y_true, y_pred : arrays shape (N, 2) avec (X, Y)
-
-    Retourne un dict prêt à logger / mettre en DataFrame.
+    Métriques utiles pour la localisation 2D.
+    Entrées y_true, y_pred : matrices (N,2) contenant (X,Y).
+    Retour : dictionnaire contenant RMSE, MAE, percentiles (p68,p90,p95), couverture P(err<seuil), etc.
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -767,7 +822,7 @@ def feature_engineering_best(
         rolling_imu_cols_present = [c for c in rolling_imu_cols if c in df.columns]
         if len(rolling_imu_cols_present) > 0:
             if verbose:
-                print(f"[FE] Generating rolling features (window={rolling_window_size}) on {len(rolling_imu_cols_present)} IMU cols...")
+                print(f"[FE] Génération des rolling features (window={rolling_window_size}) sur {len(rolling_imu_cols_present)} colonnes IMU...")
 
             grp = df.groupby(list(rolling_group_cols), sort=False) if all(gc in df.columns for gc in rolling_group_cols) else None
 
@@ -806,7 +861,7 @@ def feature_engineering_best(
                     df[c] = df[c].fillna(med)
 
             if verbose:
-                print(f"[FE] New rolling features created: {len(roll_cols)}")
+                print(f"[FE] Nouvelles rolling features créées: {len(roll_cols)}")
 
     # ---------- 3) IMU derivatives ----------
     dt_ms = df[time_col].diff()
@@ -896,7 +951,56 @@ def feature_engineering_best(
     return df, X_fe, y, meta, feature_cols
 
 
+# Device-wise RSSI calibration utilities
+def get_wifi_columns(df, prefixes=("eduroam","tp-link","clickshare","telephone","elb","direct","_be")):
+    return [c for c in df.columns if any(str(c).lower().startswith(p) for p in prefixes)]
+
+def calibrate_rssi_by_device(df, method='median_offset'):
+    """Return a copy of df with calibrated RSSI columns.
+    method: 'median_offset' or 'zscore'
+    Adds suffixes: _rssi_med_adj or _rssi_z
+    """
+    df = df.copy()
+    wifi_cols = get_wifi_columns(df)
+    if len(wifi_cols) == 0:
+        print('No WiFi columns detected for calibration.'); return df
+    devs = df['device'].unique() if 'device' in df.columns else []
+    for col in wifi_cols:
+        if method == 'median_offset':
+            # compute device median and subtract per-device median
+            med_by_dev = df.groupby('device')[col].median()
+            adj_col = col + '_rssi_med_adj'
+            df[adj_col] = df[col].copy()
+            for d in med_by_dev.index:
+                mask = df['device'] == d
+                df.loc[mask, adj_col] = df.loc[mask, col] - med_by_dev.loc[d]
+        elif method == 'zscore':
+            z_col = col + '_rssi_z'
+            df[z_col] = df[col].copy()
+            mean_by_dev = df.groupby('device')[col].transform('mean')
+            std_by_dev = df.groupby('device')[col].transform('std').replace(0, 1.0)
+            df[z_col] = (df[col] - mean_by_dev) / std_by_dev
+        else:
+            raise ValueError('Unknown method')
+    return df
+
+# %% [markdown]
+# ### Résultats attendus du feature engineering
+# 
+# Les transformations appliquées ne visent pas à résoudre à elles seules le problème de localisation indoor, mais à :
+# 
+# - Améliorer la stabilité des prédictions pointwise.
+# - Réduire la variance des erreurs sur les sessions courantes.
+# - Faciliter l’apprentissage des modèles séquentiels en fournissant un contexte temporel local plus informatif.
+# - Mettre en évidence les limites structurelles du signal disponible, notamment en situation cross-device.
+# 
+# Les résultats montrent que le feature engineering permet d’extraire des informations pertinentes pour la localisation, tout en confirmant que l’absence de contraintes spatiales explicites (carte, topologie) constitue une limite fondamentale du système.
+
 # %%
+# ------------------------------------------------------------
+# Préparation des données — train/test split
+# ------------------------------------------------------------
+
 df0 = df_trimmed.copy()
 df0["session_id"] = df0["device"].astype(str) + "__" + df0["motion"].astype(str)
 
@@ -907,8 +1011,8 @@ train_idx, test_idx = next(gss.split(df0, groups=groups))
 df_train = df0.iloc[train_idx].copy().reset_index(drop=True)
 df_test  = df0.iloc[test_idx].copy().reset_index(drop=True)
 
-print("Train sessions:", df_train["session_id"].nunique(), sorted(df_train["session_id"].unique())[:5])
-print("Test sessions :", df_test["session_id"].nunique(),  sorted(df_test["session_id"].unique())[:5])
+print("Sessions d'entraînement:", df_train["session_id"].nunique(), sorted(df_train["session_id"].unique())[:5])
+print("Sessions de test     :", df_test["session_id"].nunique(),  sorted(df_test["session_id"].unique())[:5])
 
 
 # --- FE train ---
@@ -925,6 +1029,10 @@ df_train_fe, X_train_fe, y_train_df, meta_train, feature_cols_train = feature_en
 # labels train (alignés avec X_train_fe)
 y_train = df_train_fe[["label_X","label_Y"]].to_numpy()
 
+# calibration
+df_train_fe = calibrate_rssi_by_device(df_train_fe, method="median_offset")
+print('Calibration (median_offset) applied to df_train_fe')
+
 # --- FE test ---
 df_test_fe, X_test_fe, y_test_df, meta_test, feature_cols_test = feature_engineering_best(
     df_test,
@@ -937,6 +1045,9 @@ df_test_fe, X_test_fe, y_test_df, meta_test, feature_cols_test = feature_enginee
 )
 
 y_test = df_test_fe[["label_X","label_Y"]].to_numpy()
+
+df_test_fe = calibrate_rssi_by_device(df_test_fe, method="median_offset")
+print('Calibration (median_offset) applied to df_test_fe')
 
 
 # --- alignement strict pour éviter 62 vs 64 ---
@@ -970,7 +1081,50 @@ preprocessor = ColumnTransformer(
 print("ColumnTransformer 'preprocessor' created successfully.")
 
 # %% [markdown]
-# ## Train regression
+# ### Sanity check
+
+# %%
+# Sanity checks and diagnostics
+def sanity_checks(df, name='df'):
+    print(f'--- Sanity checks: {name} ---')
+    print('shape:', df.shape)
+    nulls = df.isna().sum()
+    pct_null = (nulls / len(df) * 100).sort_values(ascending=False)
+    print('Top 10 columns by % NaN:')
+    print(pct_null.head(10))
+    if 't_ms' in df.columns:
+        dt = df['t_ms'].diff().dropna()
+        print('dt ms — median:', dt.median(), 'mean:', dt.mean(), 'min:', dt.min(), 'max:', dt.max())
+    if 'device' in df.columns and 'motion' in df.columns:
+        print('Unique sessions (device__motion):', df.groupby(['device','motion']).ngroups)
+    wifi_cols = get_wifi_columns(df)
+    if len(wifi_cols) > 0:
+        pres = df[wifi_cols].notna().mean().sort_values(ascending=False)
+        print('Top WiFi presence (top 10):')
+        print(pres.head(10))
+    print('--- end checks ---')
+
+# Run sanity checks if df_trimmed and X_preprocessed exist
+try:
+    if 'df_trimmed' in globals():
+        sanity_checks(df_trimmed, 'df_trimmed')
+    if 'df_train_fe' in globals():
+        sanity_checks(df_train_fe, 'df_train_fe')
+    if 'df_test_fe' in globals():
+        sanity_checks(df_test_fe, 'df_test_fe')
+except Exception as e:
+    print('Sanity checks error:', e)
+
+# %% [markdown]
+# ## Modèles tabulaires — approche et attentes
+# 
+# Approche : entraîner des modèles pointwise sur les features agrégées (rolling IMU, dérivées, top‑K Wi‑Fi) avec un préprocesseur (scaler + OHE). Les cibles sont label_X et label_Y (régression multivariée ou modèles séparés pour X et Y).
+# 
+# Modèles testés : LinearRegression (baseline), kNN (fingerprinting), RandomForest, XGBoost.
+# 
+# Attentes et diagnostics :
+# - Attente : RF / XGBoost surpassent la régression linéaire ; kNN performant localement mais sensible au bruit RSSI.
+# - En cas de résultats inattendus : rechercher fuite d'information, vérifier alignement colonnes train/test, inspecter importances et résidus par session.
 
 # %% [markdown]
 # ### kNN
@@ -1072,7 +1226,17 @@ results.append(res_xgb_fe)
 print("XGBoost FE evaluated.")
 
 # %% [markdown]
-# ## Train Sequentiel
+# ## Modèles séquentiels — objectifs et validation
+# 
+# Objectif : exploiter la continuité temporelle via des fenêtres glissantes (windowed) pour stabiliser les prédictions et réduire les erreurs extrêmes.
+# 
+# Architecture et protocole :
+# - Construction de séquences par session (pour éviter les fenêtres traversant des sessions), normalisation fit sur le train uniquement, Group‑split pour validation.
+# - Modèles : LSTM et GRU avec tête MLP (architecture 'diamond'). Early stopping par validation groupée.
+# 
+# Attentes :
+# - Les séquentiels n'améliorent pas nécessairement la médiane globale mais doivent réduire p95/p99 sur trajectoires complexes.
+# - Attention au surapprentissage si peu de sessions : privilégier GRU simple ou régularisation.
 
 # %%
 def build_sequences(
@@ -1100,9 +1264,10 @@ def build_sequences(
 
     for _, g in groups:
         # Sort by 't_ms' to ensure temporal order within each group/session
-        g = g.sort_values("t_ms").reset_index(drop=True)
+        g = g.sort_values("t_ms")
         values = g[feature_cols].values
         targets = g[list(target_cols)].values
+        global_indices = g.index.values
 
         n = len(g)
         if n < window_size:
@@ -1110,8 +1275,8 @@ def build_sequences(
             continue
 
         for start in range(0, n - window_size + 1):
-            idx_seq.append(start + window_size - 1)
             end = start + window_size
+            idx_seq.append(global_indices[end-1])
             X_seqs.append(values[start:end, :])
             # Target is the position at the last timestamp of the window
             y_seqs.append(targets[end - 1])
@@ -1120,9 +1285,9 @@ def build_sequences(
     y_seqs = np.array(y_seqs)  # (N_seq, 2)
 
     return X_seqs, y_seqs, idx_seq
+    
 
 # %%
-
 # ------------------------------------------------------------
 # Dataset PyTorch
 # ------------------------------------------------------------
@@ -1226,6 +1391,24 @@ test_ohe = test_ohe.reindex(
 
 print(f"Number of features for LSTM/GRU after OHE: {len(feature_cols_lstm_gru)}")
 
+# OPTIONAL : WINDOW_SIZE sweep diagnostics — computes sequence counts per WINDOW_SIZE
+print("Diagnostic of window sizes")
+window_sizes = [5, 10, 20, 40]
+sweep_results = []
+for W in window_sizes:
+    try:
+        X_tr, y_tr, idx_tr = build_sequences(train_ohe, feature_cols_lstm_gru, window_size=W, session_col='session_id')
+        X_te, y_te, idx_te = build_sequences(test_ohe, feature_cols_lstm_gru, window_size=W, session_col='session_id')
+        sweep_results.append({'window':W, 'n_train_seq':len(X_tr), 'n_test_seq':len(X_te)})
+    except Exception as e:
+        sweep_results.append({'window':W, 'error':str(e)})
+print(pd.DataFrame(sweep_results))
+
+# Optional quick training prototype (disabled by default)
+run_quick = False
+if run_quick and 'X_tr' in globals() and len(X_tr)>0:
+    print('Quick training placeholder — set run_quick=True to run a small GRU on one window size')
+
 # 5) Build sequences séparément (train / test) groupé par session_id
 X_train_seqs, y_train_seqs, idx_seq_train = build_sequences(
     train_ohe,
@@ -1242,6 +1425,8 @@ X_test_seqs, y_test_seqs, idx_seq_test = build_sequences(
     window_size=WINDOW_SIZE,
     session_col="session_id"
 )
+seq_session_train = train_ohe.loc[idx_seq_train, "session_id"].values
+seq_session_test  = test_ohe.loc[idx_seq_test,  "session_id"].values
 
 print("X_train_seqs shape:", X_train_seqs.shape, "y_train_seqs shape:", y_train_seqs.shape)
 print("X_test_seqs  shape:", X_test_seqs.shape,  "y_test_seqs shape:",  y_test_seqs.shape)
@@ -1260,10 +1445,17 @@ Xte_flat_scaled = scaler_lstm_gru.transform(Xte_flat)
 X_test_scaled = Xte_flat_scaled.reshape(Nte, T, D)
 
 # 7) Split validation à l'intérieur du train (pas toucher au test)
-# Option simple : split sans session au niveau de sequence.
-X_train_lstm_fe, X_val_lstm_fe, y_train_lstm_fe, y_val_lstm_fe = train_test_split(
-    X_train_scaled, y_train_seqs, test_size=0.2, random_state=42
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+train_idx, val_idx = next(
+    gss.split(X_train_seqs, y_train_seqs, groups=seq_session_train)
 )
+X_train_lstm, y_train_lstm = X_train_seqs[train_idx], y_train_seqs[train_idx]
+X_val_lstm,   y_val_lstm   = X_train_seqs[val_idx],   y_train_seqs[val_idx]
+
+X_train_lstm_fe = X_train_scaled[train_idx]
+y_train_lstm_fe = y_train_seqs[train_idx]
+X_val_lstm_fe   = X_train_scaled[val_idx]
+y_val_lstm_fe   = y_train_seqs[val_idx]
 
 # 8) DataLoaders
 train_ds_fe = TrajDataset(X_train_lstm_fe, y_train_lstm_fe)
@@ -1410,7 +1602,7 @@ for epoch in range(EPOCHS):
     if val_loss < BEST_VAL_LOSS:
         BEST_VAL_LOSS = val_loss
         epochs_no_improve = 0
-        # Optionally save the best model
+        # Optionnellement, sauvegarder le meilleur modèle
         torch.save(modelLSTM_fe.state_dict(), 'best_lstm_fe.pth')
     else:
         epochs_no_improve += 1
@@ -1507,7 +1699,7 @@ for epoch in range(EPOCHS):
     if val_loss < BEST_VAL_LOSS:
         BEST_VAL_LOSS = val_loss
         epochs_no_improve = 0
-        # Optionally save the best model
+        # Optionnellement, sauvegarder le meilleur modèle
         torch.save(modelGRU_fe.state_dict(), 'best_gru_fe.pth')
     else:
         epochs_no_improve += 1
@@ -1556,7 +1748,216 @@ print("90e percentile (m) :", np.percentile(errors, 90))
 
 
 # %% [markdown]
-# # Etape 3 : Analyse par trajectoire
+# ## Analyse cross-device — procédure et critères
+# 
+# Procédure appliquée :
+# - Séparation des données par appareil (ESP32 / smartphone Samsung).
+# - Entraînement des modèles tabulaires (Random Forest, XGBoost) sur un appareil source.
+# - Évaluation sur l’appareil cible, sans données communes entre train et test.
+# - Feature engineering réalisé séparément afin d’éviter toute fuite de données, avec alignement des colonnes entre domaines.
+# - Exclusion du champ `device` des features d’entrée afin de simuler une situation réaliste où l’appareil cible est inconnu à l’entraînement.
+# - Calcul des métriques globales (median, p90, p95) via `evaluate_regression`.
+# - Visualisation des performances par :
+#   - CDF de l’erreur euclidienne,
+#   - évolution de l’erreur au cours du temps,
+#   - comparaison spatiale des positions réelles et prédites.
+# 
+# Critères d’interprétation :
+# - Une bonne robustesse cross-device se traduit par une dégradation modérée des métriques (médiane et p95) par rapport au cas intra-device.
+# - Une forte augmentation de p95/p99 indique un **domain shift** important entre appareils (différences de calibration capteurs et WiFi).
+# - La symétrie ou non des résultats (ESP32 → Samsung vs Samsung → ESP32) permet d’identifier un appareil plus stable ou mieux instrumenté.
+# - Les visualisations (CDF et nuages de points) sont utilisées pour distinguer :
+#   - une erreur globale diffuse (bruit),
+#   - des erreurs structurées liées à certaines zones ou types de mouvement.
+# - Les performances cross-device sont analysées comme une **limite structurelle du système**, et non comme un problème d’optimisation des modèles.
+# 
+
+# %%
+# Cross-device robustness tests (RF / XGB)
+def build_and_eval_tabular_cross_device(df_train_local, df_test_local, model_name='RF', return_preds=True):
+    df_tr_fe, X_tr_fe, _, _, _ = feature_engineering_best(df_train_local, verbose=False)
+    df_te_fe, X_te_fe, _, _, _ = feature_engineering_best(df_test_local, verbose=False)
+
+    y_tr = df_tr_fe[['label_X','label_Y']].to_numpy()
+    y_te = df_te_fe[['label_X','label_Y']].to_numpy()
+
+    # Cross-device “réaliste” : on retire device (inconnu au test)
+    X_tr = pd.concat([X_tr_fe, df_tr_fe[['motion']]], axis=1)
+    X_te = pd.concat([X_te_fe, df_te_fe[['motion']]], axis=1)
+
+    # Alignement colonnes
+    X_te = X_te.reindex(columns=X_tr.columns, fill_value=0.0)
+
+    cat_cols = ['motion']
+    num_cols = [c for c in X_tr.columns if c not in cat_cols]
+
+    preproc = ColumnTransformer([
+        ('num', StandardScaler(), num_cols),
+        ('cat', OneHotEncoder(handle_unknown='ignore', drop='first'), cat_cols)
+    ])
+
+    train_device = df_train_local['device'].iloc[0]
+    test_device  = df_test_local['device'].iloc[0]
+    name = f'{model_name}_{train_device}_to_{test_device}'
+
+    if model_name == 'RF':
+        model = Pipeline([('pre', preproc),
+                          ('rf', RandomForestRegressor(n_estimators=300, n_jobs=-1, random_state=42))])
+        model.fit(X_tr, y_tr)
+        y_pred = model.predict(X_te)
+
+    elif model_name == 'XGB':
+        model_x = Pipeline([('pre', preproc),
+                            ('xg', XGBRegressor(n_estimators=500, max_depth=6, learning_rate=0.05,
+                                               subsample=0.8, colsample_bytree=0.8,
+                                               random_state=42, n_jobs=-1))])
+        model_y = clone(model_x)
+        model_x.fit(X_tr, y_tr[:,0])
+        model_y.fit(X_tr, y_tr[:,1])
+        y_pred = np.column_stack([model_x.predict(X_te), model_y.predict(X_te)])
+    else:
+        raise ValueError("model_name must be 'RF' or 'XGB'")
+
+    metrics = evaluate_regression(y_te, y_pred, name=name)
+
+    if not return_preds:
+        return metrics
+
+    # timestamps si dispo (après FE, alignés sur y_te)
+    t_ms = df_te_fe['t_ms'].to_numpy() if 't_ms' in df_te_fe.columns else None
+
+    return {
+        "name": name,
+        "train_device": train_device,
+        "test_device": test_device,
+        "metrics": metrics,
+        "y_true": y_te,
+        "y_pred": y_pred,
+        "t_ms": t_ms,
+    }
+
+# %%
+def _euclid_err(y_true, y_pred):
+    d = y_true - y_pred
+    return np.sqrt(np.sum(d*d, axis=1))
+
+def plot_cross_device_result(res, max_points_scatter=5000):
+    """
+    res: dict retourné par build_and_eval_tabular_cross_device(..., return_preds=True)
+    """
+    name = res["name"]
+    y_true = res["y_true"]
+    y_pred = res["y_pred"]
+    t_ms = res.get("t_ms", None)
+
+    err = _euclid_err(y_true, y_pred)
+
+    # --- 1) CDF de l’erreur ---
+    xs = np.sort(err)
+    ys = np.arange(1, len(xs)+1) / len(xs)
+
+    plt.figure()
+    plt.plot(xs, ys)
+    plt.title(f"CDF erreur — {name}")
+    plt.xlabel("Erreur euclidienne (m)")
+    plt.ylabel("Proportion ≤ erreur")
+    plt.grid(True)
+    plt.show()
+
+    # --- 2) Erreur au fil du temps (si t_ms dispo) ---
+    if t_ms is not None:
+        order = np.argsort(t_ms)
+        t0 = t_ms[order][0]
+        t_s = (t_ms[order] - t0) / 1000.0
+
+        plt.figure()
+        plt.plot(t_s, err[order])
+        plt.title(f"Erreur vs temps — {name}")
+        plt.xlabel("Temps (s)")
+        plt.ylabel("Erreur (m)")
+        plt.grid(True)
+        plt.show()
+
+    # --- 3) Scatter True vs Pred (positions) ---
+    n = len(y_true)
+    if n > max_points_scatter:
+        idx = np.random.RandomState(42).choice(n, size=max_points_scatter, replace=False)
+        yt = y_true[idx]; yp = y_pred[idx]
+    else:
+        yt = y_true; yp = y_pred
+
+    plt.figure()
+    plt.scatter(yt[:,0], yt[:,1], s=5, alpha=0.5, label="True")
+    plt.scatter(yp[:,0], yp[:,1], s=5, alpha=0.5, label="Pred")
+    plt.title(f"Nuage positions — {name}")
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.legend()
+    plt.grid(True)
+    plt.axis("equal")
+    plt.show()
+
+def plot_cross_device_comparison(results):
+    """
+    results: liste de res dicts (ex: [RF esp->sam, RF sam->esp, XGB ...])
+    Compare les CDF sur une seule figure.
+    """
+    plt.figure()
+    for res in results:
+        err = _euclid_err(res["y_true"], res["y_pred"])
+        xs = np.sort(err)
+        ys = np.arange(1, len(xs)+1) / len(xs)
+        plt.plot(xs, ys, label=res["name"])
+    plt.title("Comparaison CDF erreur — cross-device")
+    plt.xlabel("Erreur euclidienne (m)")
+    plt.ylabel("Proportion ≤ erreur")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# %%
+# Prepare per-device splits from df_trimmed
+devices = df_trimmed['device'].unique()
+if len(devices) >= 2:
+    devices = df_trimmed['device'].unique()
+    devA, devB = devices[0], devices[1]
+    dfA = df_trimmed[df_trimmed['device']==devA].reset_index(drop=True)
+    dfB = df_trimmed[df_trimmed['device']==devB].reset_index(drop=True)
+
+    res_rf_ab  = build_and_eval_tabular_cross_device(dfA, dfB, model_name='RF',  return_preds=True)
+    res_rf_ba  = build_and_eval_tabular_cross_device(dfB, dfA, model_name='RF',  return_preds=True)
+    res_xgb_ab = build_and_eval_tabular_cross_device(dfA, dfB, model_name='XGB', return_preds=True)
+    res_xgb_ba = build_and_eval_tabular_cross_device(dfB, dfA, model_name='XGB', return_preds=True)
+
+    # Visualiser un cas
+    plot_cross_device_result(res_xgb_ab)
+
+    # Comparer tout sur une CDF unique
+    plot_cross_device_comparison([res_rf_ab, res_xgb_ab, res_rf_ba, res_xgb_ba])
+
+    # Afficher un mini résumé chiffré
+    for r in [res_rf_ab, res_xgb_ab, res_rf_ba, res_xgb_ba]:
+        m = r["metrics"]
+        print(r["name"], "median=", m["median_err_m"], "p95=", m["p95_err_m"])
+
+else:
+    print('Not enough devices for cross-device test; need at least 2 devices present in df_trimmed')
+
+# %% [markdown]
+# Cette expérience montre une mauvais généralisation de samsung vers esp32 mais une généralisation plutôt correcte de esp32 vers samsung
+
+# %% [markdown]
+# ## Analyse par trajectoire — procédure et critères
+# 
+# Procédure appliquée :
+# - Agrégation des prédictions par modèle alignées sur le dataframe test.
+# - Calcul des métriques par session (median, p90, p95, p99) via evaluate_regression.
+# - Identification des pires sessions pour inspection (boxplots p95, CDF par session).
+# 
+# Critères d'interprétation :
+# - Une bonne baseline est robuste inter‑session (faible médiane et p95 stable).
+# - Les séquentiels sont valorisés si ils réduisent significativement p95/p99 sur sessions difficiles.
+# - Repérer sessions problématiques (device/motion) pour prioriser correction labels ou calibration device‑wise.
 
 # %%
 def plot_error_cdf(
@@ -1829,7 +2230,7 @@ session_long, p95_pivot = session_analysis_device_motion(
 # Le mouvement horizontal apparaît comme le cas le plus difficile à localiser, indépendamment du modèle utilisé.
 
 # %% [markdown]
-# # Etape 4 : Analyse des résultats et discussion
+# ## Analyse des résultats et discussion
 
 # %%
 results_df = pd.DataFrame(results)
@@ -1858,7 +2259,7 @@ plot_error_cdf(
 def pick_session(df, device=None, motion=None):
     if device is None or motion is None:
         g = df.groupby(["device","motion"]).size().sort_values(ascending=False)
-        device, motion = g.index[0]
+        device, motion = g.index[1]  # skip first as it is the largest
     return device, motion
 
 def get_session_df(df_fe, X_fe_full, device, motion):
@@ -2064,7 +2465,25 @@ plt.legend()
 plt.show(block=False)
 
 # %% [markdown]
-# On voit que les prédicteur pointwise sont globalement plus mauvais pour déterminer les positions dans une séquence de mouvement que les prédicteurs séquentiels. Mais existe-t-il une solution hybride pour pallier aux deux problèmes ?
+# Une solution hybride pourrait combiner les forces des modèles séquentiels (LSTM, GRU) et des modèles non séquentiels (XGBoost, RF). L'idée est d'utiliser les prédictions des modèles non séquentiels comme entrées supplémentaires pour les modèles séquentiels, améliorant ainsi la capture des dépendances temporelles tout en bénéficiant d'une modélisation robuste des relations non linéaires.
+# 
+# Ici nous faisons une hybridation naïve pour voir le potentiel de cette méthode.
+
+# %% [markdown]
+# ### Hybridation XGBoost × LSTM — approche naïve
+# 
+# Cette approche combine un modèle pointwise (XGBoost) et un modèle séquentiel (LSTM) afin d’exploiter leurs propriétés complémentaires.
+# 
+# XGBoost fournit une estimation de position généralement plus stable en valeur absolue, mais bruitée dans le temps.  
+# Le LSTM exploite l’historique temporel pour produire des prédictions plus lisses, au prix d’une dérive spatiale possible.
+# 
+# L’hybridation retenue consiste en une combinaison linéaire simple des deux prédictions :
+# 
+# y_out = α · y_XGB + (1 − α) · y_LSTM
+# 
+# avec un coefficient α fixé à 0.5, correspondant à une pondération uniforme (50 % XGBoost, 50 % LSTM).
+# 
+# Cette méthode constitue une baseline d’hybridation simple, utilisée pour évaluer si la combinaison directe permet de réduire le bruit des prédictions pointwise tout en limitant la dérive des modèles séquentiels, sans introduire de complexité supplémentaire.
 
 # %%
 def hybrid_fusion(y_xgb, y_lstm, alpha=0.7):
@@ -2107,83 +2526,54 @@ print("RMSE XGB    :", np.sqrt(np.mean(err_xgb**2)))
 print("RMSE LSTM   :", np.sqrt(np.mean(err_lstm**2)))
 print("RMSE Hybrid :", np.sqrt(np.mean(err_hybrid**2)))
 
+# %% [markdown]
+# Les résultats de l’approche hybride montrent une meilleure concentration des prédictions dans la zone correspondant à la salle, par rapport aux modèles utilisés individuellement. Toutefois, la précision obtenue reste insuffisante pour atteindre les performances attendues en localisation absolue.
+# 
+# La forme naïve de l’hybridation n’apporte pas d’amélioration significative des métriques globales, mais elle met en évidence un potentiel de complémentarité entre les approches pointwise et séquentielles. Ces observations suggèrent qu’une stratégie d’hybridation plus élaborée, notamment avec une pondération adaptative ou dépendante du contexte, pourrait permettre d’exploiter plus efficacement les atouts de chaque modèle.
+# 
+# Par exemple utiliser les prédictions pointwise en entrées du modèle séquentiel puis générer un delta de correction pour lisser le résultat permettrait de mieux tirer partie des avantages de chaque modèle.
 
 # %% [markdown]
-# ## Conclusion sur les différents modèles
+# ## Conclusion — synthèse technique des modèles
 # 
-# Les résultats obtenus au cours de cette étude mettent en évidence la complexité intrinsèque du problème de localisation indoor à partir de données hétérogènes issues de capteurs inertiels et de signaux Wi-Fi. Les évaluations réalisées à l’aide de métriques adaptées au contexte applicatif (erreur radiale, percentiles p90/p95, CDF des erreurs et analyse par session) montrent que les performances globales peuvent masquer des comportements très contrastés selon les trajectoires, les dispositifs et les types de mouvement.
+# Résumé des objectifs  
+# - Estimer la position 2D à partir d'IMU et de RSSI, comparer approches pointwise (kNN, RF, XGBoost) et séquentielles (LSTM, GRU), et évaluer la robustesse par session (device/motion).
 # 
-# Les modèles non séquentiels, en particulier la Random Forest, offrent une excellente performance globale et une bonne robustesse inter-session. Ils constituent ainsi des baselines solides pour ce type de problématique. XGBoost atteint des performances comparables en termes de précision médiane, mais se révèle plus sensible aux cas difficiles, ce qui se traduit par des erreurs extrêmes plus élevées sur certaines sessions.
+# Principaux résultats
+# - Modèle linéaire : insuffisant pour capturer la non‑linéarité présente dans les données brutes.
+# - kNN (fingerprinting) : performant pour des erreurs faibles en zones denses d'empreintes, mais peu robuste aux variations de RSSI et aux sessions non‑observées.
+# - Modèles tabulaires : Random Forest fournit la meilleure robustesse inter‑session sur nos jeux de données (médiane et p95 globalement faibles). XGBoost atteint une précision médiane comparable mais tend à produire des queues d'erreur plus longues (cas difficiles / outliers).
+# - Modèles séquentiels : LSTM et GRU n'améliorent pas systématiquement la médiane, mais apportent une réduction notable des erreurs extrêmes (p95/p99) sur certaines trajectoires complexes. Le GRU, plus simple, montre une meilleure stabilité quand le nombre de sessions est limité.
+# - Fusion hybride (ex. pondération XGBoost + LSTM sur une trajectoire test) : montre un effet bénéfique sur la trajectoire testée (lissage et réduction ponctuelle du RMSE) — résultat prometteur mais encore expérimental.
 # 
-# Les modèles séquentiels (LSTM et GRU) n’améliorent pas systématiquement la précision instantanée, mais apportent un gain notable en termes de stabilité et de réduction des erreurs extrêmes sur des trajectoires complexes. Le GRU apparaît comme le compromis le plus intéressant parmi les modèles séquentiels testés, combinant une architecture plus simple et une meilleure robustesse dans ce cadre expérimental.
-# 
-# L’analyse par session a par ailleurs montré que les performances dépendent fortement du contexte, notamment du type de mouvement et du dispositif utilisé. Certaines sessions concentrent l’essentiel des erreurs élevées, ce qui souligne l’importance d’une évaluation contextuelle et multi-niveaux pour juger de la pertinence réelle d’un modèle de localisation indoor.
-# 
-
-# %% [markdown]
-# ## Discussion
-# 
-# ### 1. Analyse globale des performances
-# 
-# Les résultats obtenus montrent que la localisation indoor à partir de signaux hétérogènes (IMU et Wi-Fi) constitue un problème fortement non linéaire et dépendant du contexte expérimental. Les modèles linéaires utilisés en baseline se révèlent insuffisants pour capturer la complexité des relations entre les observations capteurs et la position 2D, ce qui confirme la nécessité de recourir à des méthodes d’apprentissage plus expressives.
-# 
-# Parmi les modèles non séquentiels évalués, la Random Forest se distingue par une meilleure robustesse globale, en particulier sur les métriques liées aux erreurs extrêmes (p90, p95). À l’inverse, XGBoost présente une précision médiane comparable, mais une plus grande variabilité dans les cas difficiles, traduisant une sensibilité accrue aux configurations ambiguës du signal. Ces résultats suggèrent que la capacité d’agrégation de décisions de la Random Forest permet une meilleure généralisation inter-session dans ce contexte.
-# 
-# Le modèle de type k-nearest neighbors, utilisé comme baseline spécifique au domaine de la localisation indoor (fingerprinting), obtient de bonnes performances sur les faibles distances, mais s’effondre rapidement lorsque l’erreur augmente. Ce comportement est cohérent avec la littérature, le kNN étant particulièrement sensible au bruit RSSI, à la variabilité temporelle du signal et aux changements de contexte environnemental.
-# 
-# ---
-# 
-# ### 2. Apport des modèles séquentiels
-# 
-# Les modèles séquentiels (LSTM et GRU) n’améliorent pas systématiquement la précision médiane par rapport aux modèles non séquentiels. En revanche, ils montrent un intérêt notable dans la réduction des erreurs extrêmes sur certaines trajectoires complexes, comme le met en évidence l’analyse des queues de distribution (CDF) et des métriques p95.
-# 
-# Ce comportement s’explique par la capacité des réseaux récurrents à exploiter la continuité temporelle de la trajectoire, ce qui permet d’amortir les fluctuations ponctuelles du signal Wi-Fi et des capteurs inertiels. Le GRU, en particulier, présente une meilleure stabilité que le LSTM dans ce cadre expérimental, ce qui peut être attribué à une architecture plus simple et moins sujette au sur-apprentissage compte tenu de la taille du jeu de données.
-# 
-# Ces observations suggèrent que les modèles séquentiels sont davantage pertinents dans une optique de robustesse et de fiabilité, plutôt que pour l’optimisation de la précision instantanée.
-# 
-# ---
-# 
-# ### 3. Analyse par session et dépendance au contexte
-# 
-# L’analyse par session (définie ici par le couple *device*–*motion*) met en évidence de fortes disparités de performance selon le type de mouvement et le matériel utilisé. Certaines sessions, en particulier celles associées à des mouvements horizontaux, présentent des erreurs significativement plus élevées quel que soit le modèle considéré.
-# 
-# Ce résultat indique que les difficultés de localisation sont en grande partie liées à la nature du signal lui-même, et non uniquement au choix de l’algorithme. La dépendance aux conditions de mouvement et au dispositif utilisé souligne l’importance de considérer des métriques par session, les métriques globales pouvant masquer des comportements problématiques localisés.
-# 
-# Il est également important de noter que l’analyse par session pour les modèles séquentiels est réalisée sur un sous-ensemble des données, correspondant aux points pour lesquels une prédiction valide peut être produite après fenêtrage temporel. Certaines sessions sont ainsi exclues faute de points exploitables, ce qui constitue une limite méthodologique assumée et explicitée.
-# 
-# ---
-# 
-# ### 4. Limites de l’approche
-# 
-# Plusieurs limites doivent être soulignées. Tout d’abord, la définition des sessions comme couples (*device*, *motion*) conduit à une agrégation de plusieurs trajectoires expérimentales distinctes, ce qui peut masquer des variations intra-session. Une définition plus fine des sessions, basée sur des identifiants de trajectoires ou de fichiers d’acquisition, permettrait une analyse plus granulaire.
-# 
-# Par ailleurs, le feature engineering, bien que riche, repose sur des statistiques locales (fenêtres glissantes, dérivées temporelles) et une sélection heuristique des points d’accès Wi-Fi. Une approche plus formelle de type *fit/transform* ou l’intégration de modèles probabilistes de propagation pourrait améliorer la rigueur du pipeline.
-# 
-# Enfin, l’approche proposée ne tient pas compte de contraintes topologiques ou cartographiques (murs, couloirs), ni de mécanismes de recalage inertiel ou de fusion probabiliste (par exemple via filtres de Kalman ou méthodes de SLAM). Ces éléments constituent des pistes d’amélioration naturelles pour une application en conditions réelles.
-# 
-# ---
-# 
-# ### 5. Perspectives
-# 
-# Les résultats obtenus montrent qu’une combinaison de modèles non séquentiels robustes et de modèles séquentiels orientés vers la stabilité constitue une approche prometteuse pour la localisation indoor. Des travaux futurs pourraient explorer des architectures hybrides, combinant prédictions instantanées et lissage temporel, ou intégrer des informations structurelles sur l’environnement.
-# 
-# Dans l’ensemble, cette étude met en évidence l’importance d’une évaluation rigoureuse, multi-critères et contextuelle, pour juger de la pertinence des modèles de localisation indoor, au-delà des seules métriques globales moyennes.
+# Recommandations pratiques
+# - Pour une baseline opérationnelle : déployer Random Forest / XGBoost (avec Group‑CV) et monitorer erreurs par session/device.  
+# - Pour la stabilité temporelle : privilégier une architecture GRU simple (ou un lissage post‑processing comme Kalman) et valider par sessions distinctes.  
+# - Pour les cas critiques : tester une stratégie hybride (pointwise pour information instantanée + séquentiel pour lissage) et évaluer systématiquement par Group‑CV.
+# - Vérifier systématiquement la qualité des labels densifiés (comparaison anchor vs densified) avant tout entraînement final.
 # 
 
 # %% [markdown]
-# # Conclusion générale
+# ## Conclusion générale
 # 
-# Ce travail a permis d’explorer de manière approfondie la problématique de la localisation indoor à partir de données hétérogènes issues de capteurs inertiels et de signaux Wi-Fi, dans un contexte réaliste marqué par une forte variabilité du signal et une dépendance importante aux conditions d’acquisition. L’objectif n’était pas uniquement d’obtenir les meilleures performances possibles, mais surtout de comprendre les limites et les comportements des différentes approches de modélisation dans un cadre expérimental contrôlé et reproductible.
+# Apports du travail  
+# - Proposition d'un pipeline reproductible couvrant prétraitement, densification des labels, feature engineering (rolling, dérivées, sélection top‑K Wi‑Fi), et évaluation multi‑critères (médiane, p90/p95, CDF, analyse par session).  
+# - Comparaison méthodique entre modèles pointwise et séquentiels, et démonstration d'une approche hybride potentiellement bénéfique.
 # 
-# L’étude a mis en évidence que la localisation indoor ne peut être correctement abordée à l’aide de modèles simples ou purement linéaires. La complexité des interactions entre le mouvement, la géométrie de l’environnement, le matériel utilisé et la dynamique du signal Wi-Fi impose le recours à des modèles capables de capturer des relations non linéaires et, dans certains cas, des dépendances temporelles. Les modèles non séquentiels, en particulier la Random Forest, se sont révélés très efficaces pour exploiter des représentations enrichies des données, offrant un excellent compromis entre performance, robustesse et simplicité de mise en œuvre. Ils constituent ainsi des candidats sérieux pour une première implémentation opérationnelle.
+# Limitations principales
+# - Densification linéaire des labels : simple et utile pour densifier les cibles, mais susceptible d'introduire du bruit sur trajectoires non linéaires.  
+# - Variabilité RSSI et hétérogénéité device : nécessite calibration ou normalisation device‑wise.  
+# - Taille / diversité des sessions limitée : impacte la généralisation des modèles séquentiels.
 # 
-# Les modèles séquentiels, quant à eux, apportent un éclairage complémentaire sur la nature temporelle du problème. Bien qu’ils n’améliorent pas systématiquement la précision instantanée, ils contribuent à stabiliser les prédictions et à limiter les erreurs extrêmes sur certaines trajectoires complexes. Cette observation est particulièrement importante dans une perspective applicative, où la fiabilité et la cohérence des estimations peuvent être plus critiques que la minimisation de l’erreur moyenne. Les résultats obtenus suggèrent que l’exploitation de la temporalité doit être pensée non pas comme un substitut aux modèles classiques, mais comme un mécanisme de régularisation et de robustification.
+# Priorités et voies d'amélioration
+# 1. Validation qualité labels : comparer anchors vs densified sur échantillons critiques et corriger les segments biaisés.  
+# 2. Validation robuste : lancer Group‑CV (sessions) pour RF/XGBoost et pour l'évaluation des combinaisons hybrides.  
+# 3. Calibration device‑wise RSSI et normalisation des features de capteurs.  
+# 4. Expérimenter des méthodes de fusion temporelle (Kalman / PDR / map‑matching) et pipelines hybrides (XGBoost → GRU).  
+# 5. Collecte supplémentaire et définition fine de sessions (identifiants de trajectoire) pour augmenter la diversité et la validité des tests.
 # 
-# Un apport majeur de ce projet réside également dans l’attention portée à l’évaluation. L’utilisation de métriques adaptées au contexte de la localisation indoor, combinée à une analyse par session, a permis de dépasser une lecture purement globale des performances. Cette approche a mis en évidence des disparités importantes selon le type de mouvement et le dispositif utilisé, révélant que certaines configurations sont intrinsèquement plus difficiles à localiser. Ces résultats soulignent l’importance d’une évaluation contextualisée, sans laquelle les performances moyennes peuvent conduire à des conclusions trompeuses.
-# 
-# Enfin, ce travail met en lumière plusieurs axes d’amélioration et d’extension. L’intégration de contraintes physiques ou topologiques sur l’environnement, l’utilisation de méthodes probabilistes de fusion de capteurs, ou encore le développement d’architectures hybrides combinant prédictions instantanées et modèles temporels constituent des pistes naturelles pour améliorer la robustesse et la généralisation des systèmes de localisation indoor. De plus, une définition plus fine des sessions expérimentales et une collecte de données plus diversifiée permettraient d’affiner l’analyse et de renforcer la validité des conclusions.
-# 
-# En définitive, ce projet démontre qu’une approche méthodique, associant traitement avancé des données, choix raisonné des modèles et évaluation rigoureuse, est essentielle pour aborder efficacement la localisation indoor. Les résultats obtenus ne constituent pas une solution définitive, mais une base solide et cohérente pour des travaux futurs visant à concevoir des systèmes de positionnement intérieur plus fiables, plus robustes et mieux adaptés aux contraintes du monde réel.
+# Conclusion opérationnelle  
+# - Le pipeline proposé constitue une base solide pour un projet M2 : Random Forest/XGBoost forment une baseline robuste, les modèles séquentiels (en particulier GRU) apportent un gain en stabilité temporelle sur des trajectoires complexes, et une stratégie hybride + corrections de labels et calibration device‑wise doit être priorisée pour une démonstration applicative robuste.
 # 
 
 

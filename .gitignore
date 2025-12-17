@@ -1,2 +1,3 @@
 ./csv_from_uncloud
 *.csv
+*.pth
