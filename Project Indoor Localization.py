@@ -1650,7 +1650,7 @@ def plot_cross_device_result(res, max_points_scatter=5000):
     plt.xlabel("Erreur euclidienne (m)")
     plt.ylabel("Proportion ≤ erreur")
     plt.grid(True)
-    plt.show()
+    plt.show(block=False)
 
     # --- 2) Erreur au fil du temps (si t_ms dispo) ---
     if t_ms is not None:
@@ -1664,7 +1664,7 @@ def plot_cross_device_result(res, max_points_scatter=5000):
         plt.xlabel("Temps (s)")
         plt.ylabel("Erreur (m)")
         plt.grid(True)
-        plt.show()
+        plt.show(block=False)
 
     # --- 3) Scatter True vs Pred (positions) ---
     n = len(y_true)
@@ -1683,7 +1683,7 @@ def plot_cross_device_result(res, max_points_scatter=5000):
     plt.legend()
     plt.grid(True)
     plt.axis("equal")
-    plt.show()
+    plt.show(block=False)
 
 def plot_cross_device_comparison(results):
     """
@@ -1701,7 +1701,7 @@ def plot_cross_device_comparison(results):
     plt.ylabel("Proportion ≤ erreur")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    plt.show(block=False)
 
 # Prepare per-device splits from df_trimmed
 devices = df_trimmed['device'].unique()
@@ -2248,7 +2248,7 @@ plt.xlabel("Temps (aligné)")
 plt.title("Erreur euclidienne au fil du temps")
 plt.grid(alpha=0.3)
 plt.legend()
-plt.show(block=False)
+plt.show()
 
 print("RMSE XGB    :", np.sqrt(np.mean(err_xgb**2)))
 print("RMSE LSTM   :", np.sqrt(np.mean(err_lstm**2)))
