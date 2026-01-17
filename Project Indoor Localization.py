@@ -55,35 +55,43 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# Nettoyage des artefacts de runs précédents : suppression des fichiers temporaires générés
-if os.path.exists("dataset_trimmed_densified.csv"):
+def ask_yes_no(prompt, default=False):
+    suffix = " [Y/n] " if default else " [y/N] "
+    resp = input(f"{prompt}{suffix}").strip().lower()
+    if not resp:
+        return default
+    return resp in ("y", "yes")
+
+do_cleanup = ask_yes_no("Clean previous run artifacts?")
+
+# Nettoyage des artefacts de runs precedents : suppression des fichiers temporaires generes
+if do_cleanup and os.path.exists("dataset_trimmed_densified.csv"):
     os.remove("dataset_trimmed_densified.csv")
     print("Removed: dataset_trimmed_densified.csv")
-if os.path.exists("dataset_trimmed.csv"):
+if do_cleanup and os.path.exists("dataset_trimmed.csv"):
     os.remove("dataset_trimmed.csv")
     print("Removed: dataset_trimmed.csv")
 
-# 2. Remove the file named `y_targets.csv`
-if os.path.exists("y_targets.csv"):
+if do_cleanup and os.path.exists("y_targets.csv"):
     os.remove("y_targets.csv")
     print("Removed: y_targets.csv")
 
-# 3. Remove the file named `X_preprocessed.csv`
-if os.path.exists("X_preprocessed.csv"):
+if do_cleanup and os.path.exists("X_preprocessed.csv"):
     os.remove("X_preprocessed.csv")
     print("Removed: X_preprocessed.csv")
 
-# 4. Remove the file named `X_feature_engineered.csv`
-if os.path.exists("X_feature_engineered.csv"):
+if do_cleanup and os.path.exists("X_feature_engineered.csv"):
     os.remove("X_feature_engineered.csv")
     print("Removed: X_feature_engineered.csv")
 
-# 5. Remove the directory named `csv_from_uncloud` and all its contents.
-if os.path.exists("csv_from_uncloud"):
+if do_cleanup and os.path.exists("csv_from_uncloud"):
     shutil.rmtree("csv_from_uncloud")
     print("Removed: csv_from_uncloud")
 
-print("Initial cleanup complete.")
+if do_cleanup:
+    print("Cleanup complete.")
+else:
+    print("Skipping cleanup.")
 
 # Constantes (paramètres réutilisés dans le pipeline)
 WINDOW_SIZE = 20           # taille de la fenêtre pour les modèles séquentiels
@@ -268,21 +276,35 @@ def build_final_dataset(dfs: dict) -> pd.DataFrame:
 ZIP_URL = "https://uncloud.univ-nantes.fr/public.php/dav/files/fkkT27xoRkNRmsr/?accept=zip"
 OUTPUT_DIR = Path("csv_from_uncloud")
 
-# 2. Download the ZIP file if not already in path
-if not os.path.exists("csv_from_uncloud"):
+if OUTPUT_DIR.exists():
+    redownload = ask_yes_no("Re-download dataset and replace existing csv_from_uncloud?")
+    if redownload:
+        shutil.rmtree(OUTPUT_DIR)
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        zip_bytes = download_zip(ZIP_URL)
+        print("[+] ZIP downloaded.")
+        csv_paths = extract_csv_from_zip(zip_bytes, OUTPUT_DIR)
+        print(f"[+] {len(csv_paths)} CSV files extracted.")
+        dfs_loaded = load_csvs_to_dataframes(csv_paths)
+        print(f"[+] {len(dfs_loaded)} DataFrames loaded.")
+        df = build_final_dataset(dfs_loaded)
+        print(f"[+] Initial combined DataFrame shape: {df.shape}")
+    else:
+        csv_paths = list(Path.joinpath(OUTPUT_DIR, 'CAO_Project-IndoorLocalization/Dataset').glob('*.csv'))
+        if not csv_paths:
+            raise FileNotFoundError("csv_from_uncloud exists but contains no CSV files.")
+        dfs_loaded = load_csvs_to_dataframes(csv_paths)
+        print(f"[+] {len(dfs_loaded)} DataFrames loaded from existing folder.")
+        df = build_final_dataset(dfs_loaded)
+        print(f"[+] Initial combined DataFrame shape: {df.shape}")
+else:
     OUTPUT_DIR.mkdir(exist_ok=True)
     zip_bytes = download_zip(ZIP_URL)
     print("[+] ZIP downloaded.")
-
-    # 3. Extract the CSV files
     csv_paths = extract_csv_from_zip(zip_bytes, OUTPUT_DIR)
     print(f"[+] {len(csv_paths)} CSV files extracted.")
-
-    # 4. Load the extracted CSVs into a dictionary of DataFrames
     dfs_loaded = load_csvs_to_dataframes(csv_paths)
     print(f"[+] {len(dfs_loaded)} DataFrames loaded.")
-
-    # 5. Build the final df DataFrame
     df = build_final_dataset(dfs_loaded)
     print(f"[+] Initial combined DataFrame shape: {df.shape}")
 
