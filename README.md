@@ -81,6 +81,39 @@ Each trajectory is associated with:
 
 ---
 
+## Installation (Linux venv)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 \
+    --index-url https://pypi.org/simple \
+    -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+```
+
+### Utilization
+
+```bash
+source .venv/bin/activate
+pip install jupyter
+jupyter notebook
+```
+
+It will open a browser page where you can select Report_Indoor_Localisation.ipynb and run it in the notebook or in the lab.
+Results will be stored in `outputs/` and figures generated are previewed in the notebook directly.
+
+## installation and utilization (Windows)
+
+```ps1
+python -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 \
+    --index-url https://pypi.org/simple \
+    -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+    python -m pip install jupyter
+jupyter notebook
+```
+
+---
+
 ## Author
 
 Master's student - Embedded Systems & Artificial Intelligence  
