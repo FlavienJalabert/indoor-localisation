@@ -1,3 +1,13 @@
-./csv_from_uncloud
 *.csv
 *.pth
+*.npz
+*.joblib
+*.pkl
+*.log
+
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+outputs/
+
+tools/

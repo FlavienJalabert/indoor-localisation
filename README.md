@@ -11,6 +11,7 @@ This repository contains an **indoor localization** project based on **WiFi** si
 The goal is to study the feasibility and limits of **data-driven** approaches for estimating a 2D position in indoor environments.
 
 The project compares:
+
 - **Pointwise (static)** models,
 - **Sequential** models (LSTM / GRU),
 - A **simple hybridation** between the two,
@@ -33,12 +34,14 @@ This work is part of an academic Master 2 project (ETAI) and focuses on a **rigo
 ## Data
 
 The dataset includes multiple indoor trajectories recorded with:
+
 - WiFi RSSI measurements,
 - Inertial sensors (accelerometer, magnetometer, gyroscope),
 - Absolute timestamps,
 - Reference positions (X, Y labels).
 
 Each trajectory is associated with:
+
 - a device (`ESP32` or `Samsung`),
 - a motion context (`motion`).
 
@@ -47,17 +50,20 @@ Each trajectory is associated with:
 ## Methodology
 
 ### Feature Engineering
+
 - Selection and encoding of WiFi access points (top-k, presence, RSSI).
 - Raw inertial signals with simple derivatives and rolling statistics.
 - Encoding of contextual variables (`motion`).
 - Controlled exclusion of `device` during cross-device tests.
 
 ### Models
+
 - **Pointwise**: Random Forest, XGBoost, kNN
 - **Sequential**: LSTM, GRU
 - **Naive Hybrid**: linear combination of XGB / LSTM
 
 ### Evaluation
+
 - Cross-device tests.
 - Trajectory-based splits (no temporal leakage).
 - Metrics: median, p90/p95, CDF of error.
