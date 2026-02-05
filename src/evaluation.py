@@ -33,7 +33,14 @@ from artifacts import (
     save_json,
     load_json,
 )
-from feature_engineering import feature_engineering_best, fit_wifi_selector
+from feature_engineering import (
+    feature_engineering_best,
+    fit_wifi_selector,
+    build_device_calibration_table,
+    apply_device_calibration,
+    fit_feature_normalizer,
+    apply_feature_normalizer,
+)
 from tabular_models import (
     build_preprocessor,
     train_knn,
@@ -344,6 +351,288 @@ def _stabilize_predictions_by_group(
     return out
 
 
+def _calibration_mask(df_ref: pd.DataFrame, cfg: Config) -> np.ndarray:
+    """Label-based calibration anchor mask."""
+    if not {"label_X", "label_Y"}.issubset(df_ref.columns):
+        return np.zeros(len(df_ref), dtype=bool)
+    xy_tol = float(_get_cfg(cfg, "device_calibration_xy_tol", 0.2))
+    y_range = tuple(_get_cfg(cfg, "device_calibration_y_range", (0.0, 1.0)))
+    y0, y1 = float(y_range[0]), float(y_range[1])
+    x = pd.to_numeric(df_ref["label_X"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(df_ref["label_Y"], errors="coerce").to_numpy(dtype=float)
+    return (np.abs(x) <= xy_tol) & (y >= y0 - xy_tol) & (y <= y1 + xy_tol)
+
+
+def _calibration_prefix_groups(
+    df_ref: pd.DataFrame,
+    cfg: Config,
+    *,
+    min_points: int,
+) -> List[np.ndarray]:
+    """Return per-group index arrays for the calibration prefix (no labels)."""
+    raw_prefix = _get_cfg(cfg, "postproc_align_prefix_points", None)
+    try:
+        prefix_points = int(raw_prefix) if raw_prefix is not None else int(min_points)
+    except (TypeError, ValueError):
+        prefix_points = int(min_points)
+    if prefix_points <= 0:
+        prefix_points = int(min_points)
+    prefix_points = max(int(min_points), int(prefix_points))
+
+    time_col = str(_get_cfg(cfg, "time_col", "t_ms"))
+    group_cols = [c for c in ("session_id", "segment_id") if c in df_ref.columns]
+    groups: List[np.ndarray] = []
+
+    if group_cols:
+        for _, g in df_ref.groupby(group_cols, sort=False):
+            if g.empty:
+                continue
+            if time_col in g.columns:
+                g = g.sort_values(time_col, kind="mergesort")
+            if prefix_points is not None and len(g) > prefix_points:
+                g = g.iloc[:prefix_points]
+            idx = g.index.to_numpy(dtype=int)
+            if idx.size:
+                groups.append(idx)
+        return groups
+
+    if time_col in df_ref.columns:
+        df_ref = df_ref.sort_values(time_col, kind="mergesort")
+    idx = df_ref.index.to_numpy(dtype=int)
+    if prefix_points is not None and idx.size > prefix_points:
+        idx = idx[:prefix_points]
+    if idx.size:
+        groups.append(idx)
+    return groups
+
+
+def _fit_alignment_transform(
+    y_pred: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    allow_swap: bool = True,
+    mode: str = "auto",
+) -> Dict[str, np.ndarray] | None:
+    y_pred = np.asarray(y_pred, dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+    if y_pred.ndim != 2 or y_true.ndim != 2 or y_pred.shape[1] != 2 or y_true.shape[1] != 2:
+        return None
+    if len(y_pred) == 0 or len(y_true) == 0:
+        return None
+
+    pred_mean = np.nanmean(y_pred, axis=0)
+    true_mean = np.nanmean(y_true, axis=0)
+    pred_c = y_pred - pred_mean
+    true_c = y_true - true_mean
+
+    mode = str(mode or "auto").lower()
+    if mode in {"flip_y", "y_flip", "mirror_y"}:
+        mats = [
+            np.array([[1.0, 0.0], [0.0, 1.0]]),
+            np.array([[-1.0, 0.0], [0.0, 1.0]]),
+        ]
+    elif mode in {"flip_x", "x_flip", "mirror_x"}:
+        mats = [
+            np.array([[1.0, 0.0], [0.0, 1.0]]),
+            np.array([[1.0, 0.0], [0.0, -1.0]]),
+        ]
+    elif mode in {"flip_xy", "flip_both", "mirror_xy"}:
+        mats = [
+            np.array([[1.0, 0.0], [0.0, 1.0]]),
+            np.array([[-1.0, 0.0], [0.0, -1.0]]),
+        ]
+    elif mode in {"swap", "swap_xy"}:
+        mats = [
+            np.array([[1.0, 0.0], [0.0, 1.0]]),
+            np.array([[0.0, 1.0], [1.0, 0.0]]),
+        ]
+    else:
+        mats = [
+            np.array([[1.0, 0.0], [0.0, 1.0]]),
+            np.array([[-1.0, 0.0], [0.0, 1.0]]),
+            np.array([[1.0, 0.0], [0.0, -1.0]]),
+            np.array([[-1.0, 0.0], [0.0, -1.0]]),
+        ]
+        if allow_swap:
+            mats += [
+                np.array([[0.0, 1.0], [1.0, 0.0]]),
+                np.array([[0.0, -1.0], [1.0, 0.0]]),
+                np.array([[0.0, 1.0], [-1.0, 0.0]]),
+                np.array([[0.0, -1.0], [-1.0, 0.0]]),
+            ]
+
+    def _alignment_error(a: np.ndarray, b: np.ndarray) -> float:
+        err = np.linalg.norm(a - b, axis=1)
+        return float(np.nanmedian(err))
+
+    best = None
+    best_err = np.inf
+    for mat in mats:
+        aligned = pred_c @ mat.T + true_mean
+        err = _alignment_error(aligned, y_true)
+        if np.isfinite(err) and err < best_err:
+            best_err = err
+            best = mat
+
+    if best is None:
+        return None
+
+    return {"matrix": best, "pred_mean": pred_mean, "true_mean": true_mean, "aligned_err": best_err}
+
+
+def _apply_alignment_transform(y_pred: np.ndarray, align: Dict[str, np.ndarray] | None) -> np.ndarray:
+    if align is None:
+        return y_pred
+    mat = np.asarray(align.get("matrix"), dtype=float)
+    pred_mean = np.asarray(align.get("pred_mean"), dtype=float)
+    true_mean = np.asarray(align.get("true_mean"), dtype=float)
+    if mat.shape != (2, 2):
+        return y_pred
+    return (y_pred - pred_mean) @ mat.T + true_mean
+
+
+def _maybe_align_by_calibration(
+    y_pred: np.ndarray,
+    df_ref: pd.DataFrame,
+    *,
+    cfg: Config,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray] | None]:
+    if not bool(_get_cfg(cfg, "postproc_align_enabled", False)):
+        return y_pred, None
+    min_points = int(_get_cfg(cfg, "postproc_align_min_points", 20))
+    allow_swap = bool(_get_cfg(cfg, "postproc_align_allow_swap", True))
+    mode = str(_get_cfg(cfg, "postproc_align_mode", "auto"))
+    neg_eps = float(_get_cfg(cfg, "postproc_align_negative_eps", 0.2))
+    use_true = bool(_get_cfg(cfg, "postproc_align_use_true", False))
+
+    y_pred_arr = np.asarray(y_pred, dtype=float)
+    mode_lower = mode.lower()
+    if mode_lower in {"x_sign", "x_sign_bounds", "fix_x_sign"}:
+        finite = np.isfinite(y_pred_arr).all(axis=1)
+        if int(finite.sum()) < min_points:
+            return y_pred, None
+        med_x = float(np.nanmedian(y_pred_arr[finite, 0]))
+        med_y = float(np.nanmedian(y_pred_arr[finite, 1]))
+        if med_x >= -neg_eps and med_y >= -neg_eps:
+            return y_pred, None
+        align = {
+            "matrix": np.array([[-1.0, 0.0], [0.0, 1.0]]),
+            "pred_mean": np.zeros(2, dtype=float),
+            "true_mean": np.zeros(2, dtype=float),
+            "aligned_err": np.nan,
+        }
+        return _apply_alignment_transform(y_pred_arr, align), align
+
+    if use_true:
+        mask = _calibration_mask(df_ref, cfg)
+        if int(mask.sum()) < min_points:
+            return y_pred, None
+
+        y_true = df_ref.loc[mask, ["label_X", "label_Y"]].to_numpy(dtype=float)
+        y_pred_seg = y_pred_arr[mask]
+        finite = np.isfinite(y_true).all(axis=1) & np.isfinite(y_pred_seg).all(axis=1)
+        if int(finite.sum()) < min_points:
+            return y_pred, None
+
+        y_true = y_true[finite]
+        y_pred_seg = y_pred_seg[finite]
+    else:
+        groups = _calibration_prefix_groups(df_ref, cfg, min_points=min_points)
+        if not groups:
+            return y_pred, None
+        y0, y1 = _get_cfg(cfg, "device_calibration_y_range", (0.0, 1.0))
+        y0 = float(y0)
+        y1 = float(y1)
+        y_pred_parts: List[np.ndarray] = []
+        y_true_parts: List[np.ndarray] = []
+        for idx in groups:
+            if idx.size == 0:
+                continue
+            y_part = y_pred_arr[idx]
+            if y_part.ndim != 2 or y_part.shape[1] != 2:
+                continue
+            finite = np.isfinite(y_part).all(axis=1)
+            y_part = y_part[finite]
+            if len(y_part) == 0:
+                continue
+            y_pred_parts.append(y_part)
+            n = len(y_part)
+            y_true_parts.append(np.column_stack([np.zeros(n, dtype=float), np.linspace(y0, y1, n, dtype=float)]))
+        if not y_pred_parts:
+            return y_pred, None
+        y_pred_seg = np.vstack(y_pred_parts)
+        y_true = np.vstack(y_true_parts)
+        if len(y_pred_seg) < min_points:
+            return y_pred, None
+
+    def _axis_sign(v: float, eps: float) -> int:
+        if v > eps:
+            return 1
+        if v < -eps:
+            return -1
+        return 0
+
+    med_pred_x = float(np.nanmedian(y_pred_seg[:, 0]))
+    med_pred_y = float(np.nanmedian(y_pred_seg[:, 1]))
+    med_true_x = float(np.nanmedian(y_true[:, 0]))
+    med_true_y = float(np.nanmedian(y_true[:, 1]))
+
+    if use_true:
+        if mode_lower in {"flip_y", "y_flip", "mirror_y"}:
+            s_pred = _axis_sign(med_pred_x, neg_eps)
+            s_true = _axis_sign(med_true_x, neg_eps)
+            if s_pred == 0 or s_true == 0 or s_pred == s_true:
+                return y_pred, None
+        elif mode_lower in {"flip_x", "x_flip", "mirror_x"}:
+            s_pred = _axis_sign(med_pred_y, neg_eps)
+            s_true = _axis_sign(med_true_y, neg_eps)
+            if s_pred == 0 or s_true == 0 or s_pred == s_true:
+                return y_pred, None
+        elif mode_lower in {"flip_xy", "flip_both", "mirror_xy"}:
+            s_pred_x = _axis_sign(med_pred_x, neg_eps)
+            s_true_x = _axis_sign(med_true_x, neg_eps)
+            s_pred_y = _axis_sign(med_pred_y, neg_eps)
+            s_true_y = _axis_sign(med_true_y, neg_eps)
+            if (
+                s_pred_x == 0
+                or s_true_x == 0
+                or s_pred_y == 0
+                or s_true_y == 0
+                or s_pred_x == s_true_x
+                or s_pred_y == s_true_y
+            ):
+                return y_pred, None
+
+    def _alignment_error(a: np.ndarray, b: np.ndarray) -> float:
+        err = np.linalg.norm(a - b, axis=1)
+        return float(np.nanmedian(err))
+
+    base_err = _alignment_error(y_pred_seg, y_true)
+    if not np.isfinite(base_err):
+        return y_pred, None
+
+    align = _fit_alignment_transform(
+        y_pred_seg,
+        y_true,
+        allow_swap=allow_swap,
+        mode=mode,
+    )
+    if align is None:
+        return y_pred, None
+
+    aligned_seg = _apply_alignment_transform(y_pred_seg, align)
+    aligned_err = _alignment_error(aligned_seg, y_true)
+    if not np.isfinite(aligned_err):
+        return y_pred, None
+
+    min_ratio = float(_get_cfg(cfg, "postproc_align_min_improve_ratio", 0.15))
+    min_abs = float(_get_cfg(cfg, "postproc_align_min_improve_m", 0.5))
+    if (base_err - aligned_err) < min_abs or aligned_err > base_err * (1.0 - min_ratio):
+        return y_pred, None
+
+    return _apply_alignment_transform(y_pred_arr, align), align
+
+
 # -------------------------
 # TABULAR
 # -------------------------
@@ -381,7 +670,31 @@ def prepare_tabular_xy(
     p_dfte = artifact_path("fe", "df_test_fe", run_id, "csv")
     p_meta = artifact_path("fe", "tabular_meta", run_id, "json")
 
-    if (not force_recompute) and all(map(exists, [p_wifi, p_cols, p_Xtr, p_Xte, p_ytr, p_yte, p_dfte, p_meta])):
+    cache_ready = (not force_recompute) and all(
+        map(exists, [p_wifi, p_cols, p_Xtr, p_Xte, p_ytr, p_yte, p_dfte, p_meta])
+    )
+    if cache_ready:
+        meta = load_json(p_meta)
+        cfg_norm_enabled = bool(_get_cfg(cfg, "fe_final_norm_enabled", True))
+        cfg_norm_by_device = bool(_get_cfg(cfg, "fe_final_norm_by_device", True))
+        cfg_cal_enabled = bool(_get_cfg(cfg, "device_calibration_enabled", False))
+        cfg_cal_quant = tuple(_get_cfg(cfg, "device_calibration_quantile_clip", (0.02, 0.98)))
+        cfg_cal_shrink = int(_get_cfg(cfg, "device_calibration_shrink_k", 100))
+        cfg_cal_scale_clip = tuple(_get_cfg(cfg, "device_calibration_scale_clip", (0.2, 5.0)))
+        cfg_cal_min_scale = float(_get_cfg(cfg, "device_calibration_min_scale", 1e-6))
+        if (
+            meta.get("final_norm_enabled") != cfg_norm_enabled
+            or meta.get("final_norm_by_device") != cfg_norm_by_device
+            or meta.get("device_calibration_enabled") != cfg_cal_enabled
+            or meta.get("device_calibration_quantile_clip") != list(cfg_cal_quant)
+            or meta.get("device_calibration_shrink_k") != cfg_cal_shrink
+            or meta.get("device_calibration_scale_clip") != list(cfg_cal_scale_clip)
+            or meta.get("device_calibration_min_scale") != cfg_cal_min_scale
+        ):
+            cache_ready = False
+            force_recompute = True
+
+    if cache_ready:
         wifi_cols = load_json(p_wifi)["wifi_cols"]
         feature_cols = load_json(p_cols)["feature_cols"]
 
@@ -448,6 +761,29 @@ def prepare_tabular_xy(
             verbose=False,
         )
 
+        # Optional final normalization on engineered numeric features (train stats only)
+        final_norm_table = None
+        if bool(_get_cfg(cfg, "fe_final_norm_enabled", True)):
+            norm_by_device = bool(_get_cfg(cfg, "fe_final_norm_by_device", True))
+            min_std = float(_get_cfg(cfg, "fe_final_norm_min_std", 1e-6))
+            final_norm_table = fit_feature_normalizer(
+                X_train_num,
+                device_series=df_train_fe["device"] if norm_by_device else None,
+                min_std=min_std,
+            )
+            X_train_num = apply_feature_normalizer(
+                X_train_num,
+                final_norm_table,
+                device_series=df_train_fe["device"] if norm_by_device else None,
+            )
+            X_test_num = apply_feature_normalizer(
+                X_test_num,
+                final_norm_table,
+                device_series=df_test_fe["device"] if norm_by_device else None,
+            )
+            if run_id:
+                save_json(final_norm_table, artifact_path("fe", "tabular_feature_norm", run_id, "json"))
+
         # labels
         y_train = df_train_fe[["label_X", "label_Y"]].to_numpy(dtype=float)
         y_test = df_test_fe[["label_X", "label_Y"]].to_numpy(dtype=float)
@@ -481,6 +817,13 @@ def prepare_tabular_xy(
             "X_test_shape": list(X_test_fe.shape),
             "meta_train_fe": meta_tr,
             "meta_test_fe": meta_te,
+            "final_norm_enabled": bool(_get_cfg(cfg, "fe_final_norm_enabled", True)),
+            "final_norm_by_device": bool(_get_cfg(cfg, "fe_final_norm_by_device", True)),
+            "device_calibration_enabled": bool(_get_cfg(cfg, "device_calibration_enabled", False)),
+            "device_calibration_quantile_clip": list(_get_cfg(cfg, "device_calibration_quantile_clip", (0.02, 0.98))),
+            "device_calibration_shrink_k": int(_get_cfg(cfg, "device_calibration_shrink_k", 100)),
+            "device_calibration_scale_clip": list(_get_cfg(cfg, "device_calibration_scale_clip", (0.2, 5.0))),
+            "device_calibration_min_scale": float(_get_cfg(cfg, "device_calibration_min_scale", 1e-6)),
         }
         save_json(meta, p_meta)
 
@@ -642,6 +985,39 @@ def prepare_seq_data(
     _require_cols(df_train, ["session_id", "device", "motion", "segment_id", "label_X", "label_Y"], "df_train")
     _require_cols(df_test, ["session_id", "device", "motion", "segment_id", "label_X", "label_Y"], "df_test")
 
+    # Optional device calibration (feature-level normalization)
+    calib_table = None
+    if bool(_get_cfg(cfg, "device_calibration_enabled", False)):
+        df_calib = pd.concat([df_train, df_test], axis=0, ignore_index=True)
+        calib_table = build_device_calibration_table(
+            df_calib,
+            ref_device=str(_get_cfg(cfg, "device_calibration_ref_device", "esp32")),
+            imu_cols=tuple(_get_cfg(cfg, "imu_cols", ())),
+            wifi_prefixes=tuple(_get_cfg(cfg, "wifi_prefixes", ())),
+            xy_tol=float(_get_cfg(cfg, "device_calibration_xy_tol", 0.2)),
+            y_range=tuple(_get_cfg(cfg, "device_calibration_y_range", (0.0, 1.0))),
+            min_rows=int(_get_cfg(cfg, "device_calibration_min_rows", 20)),
+            quantile_clip=tuple(_get_cfg(cfg, "device_calibration_quantile_clip", (0.02, 0.98))),
+            shrink_k=int(_get_cfg(cfg, "device_calibration_shrink_k", 100)),
+            scale_clip=tuple(_get_cfg(cfg, "device_calibration_scale_clip", (0.2, 5.0))),
+            min_scale=float(_get_cfg(cfg, "device_calibration_min_scale", 1e-6)),
+        )
+        if calib_table is not None:
+            df_train = apply_device_calibration(
+                df_train,
+                calib_table,
+                imu_cols=tuple(_get_cfg(cfg, "imu_cols", ())),
+                wifi_prefixes=tuple(_get_cfg(cfg, "wifi_prefixes", ())),
+            )
+            df_test = apply_device_calibration(
+                df_test,
+                calib_table,
+                imu_cols=tuple(_get_cfg(cfg, "imu_cols", ())),
+                wifi_prefixes=tuple(_get_cfg(cfg, "wifi_prefixes", ())),
+            )
+            if run_id:
+                save_json(calib_table, artifact_path("fe", "device_calibration", run_id, "json"))
+
     # Fit wifi selector on train
     wifi_cols = fit_wifi_selector(
         df_train,
@@ -789,6 +1165,29 @@ def prepare_seq_data(
             save_json({"top_corr_features": top_cols}, artifact_path("fe", "seq_pca_topcorr", run_id, "json"))
             save_joblib(scaler_pca, artifact_path("models", "seq_pca_scaler", run_id, "joblib"))
             save_joblib(pca, artifact_path("models", "seq_pca", run_id, "joblib"))
+
+    # Optional final normalization on engineered numeric features (train stats only)
+    final_norm_table = None
+    if bool(_get_cfg(cfg, "fe_final_norm_enabled", True)):
+        norm_by_device = bool(_get_cfg(cfg, "fe_final_norm_by_device", True))
+        min_std = float(_get_cfg(cfg, "fe_final_norm_min_std", 1e-6))
+        final_norm_table = fit_feature_normalizer(
+            X_train_num,
+            device_series=df_train_fe["device"] if norm_by_device else None,
+            min_std=min_std,
+        )
+        X_train_num = apply_feature_normalizer(
+            X_train_num,
+            final_norm_table,
+            device_series=df_train_fe["device"] if norm_by_device else None,
+        )
+        X_test_num = apply_feature_normalizer(
+            X_test_num,
+            final_norm_table,
+            device_series=df_test_fe["device"] if norm_by_device else None,
+        )
+        if run_id:
+            save_json(final_norm_table, artifact_path("fe", "seq_feature_norm", run_id, "json"))
 
     # Build tab for OHE
     time_col = str(_get_cfg(cfg, "time_col", "t_ms"))
@@ -1017,6 +1416,9 @@ def prepare_seq_data(
                              batch_size=batch_size, shuffle=False)
 
     # cache meta
+    calib_summary = None
+    if calib_table is not None and isinstance(calib_table, dict):
+        calib_summary = calib_table.get("summary")
     if force_recompute or (not all(map(exists, [p_feat, p_scaler, p_idx, p_meta]))):
         save_json({"feature_cols_seq": feature_cols_seq, "window_size": window_size}, p_feat)
         save_joblib(scaler, p_scaler)
@@ -1036,6 +1438,23 @@ def prepare_seq_data(
                 "train_densify_factor": float(n_train_rows_post_densify / max(1, n_train_rows_pre_densify)),
                 "test_densify_factor": float(n_test_rows_post_densify / max(1, n_test_rows_pre_densify)),
                 "build_attempts": build_attempts,
+                "device_calibration_enabled": bool(_get_cfg(cfg, "device_calibration_enabled", False)),
+                "device_calibration_summary": calib_summary,
+                "device_calibration_quantile_clip": list(_get_cfg(cfg, "device_calibration_quantile_clip", (0.02, 0.98))),
+                "device_calibration_shrink_k": int(_get_cfg(cfg, "device_calibration_shrink_k", 100)),
+                "device_calibration_scale_clip": list(_get_cfg(cfg, "device_calibration_scale_clip", (0.2, 5.0))),
+                "device_calibration_min_scale": float(_get_cfg(cfg, "device_calibration_min_scale", 1e-6)),
+                "final_norm_enabled": bool(_get_cfg(cfg, "fe_final_norm_enabled", True)),
+                "final_norm_by_device": bool(_get_cfg(cfg, "fe_final_norm_by_device", True)),
+                "postproc_align_enabled": bool(_get_cfg(cfg, "postproc_align_enabled", False)),
+                "postproc_align_min_points": int(_get_cfg(cfg, "postproc_align_min_points", 20)),
+                "postproc_align_prefix_points": int(_get_cfg(cfg, "postproc_align_prefix_points", 120)),
+                "postproc_align_allow_swap": bool(_get_cfg(cfg, "postproc_align_allow_swap", True)),
+                "postproc_align_min_improve_ratio": float(_get_cfg(cfg, "postproc_align_min_improve_ratio", 0.15)),
+                "postproc_align_min_improve_m": float(_get_cfg(cfg, "postproc_align_min_improve_m", 0.5)),
+                "postproc_align_mode": str(_get_cfg(cfg, "postproc_align_mode", "auto")),
+                "postproc_align_negative_eps": float(_get_cfg(cfg, "postproc_align_negative_eps", 0.2)),
+                "postproc_align_use_true": bool(_get_cfg(cfg, "postproc_align_use_true", False)),
             },
             p_meta,
         )
@@ -1054,6 +1473,7 @@ def prepare_seq_data(
         "df_test_fe": df_test_ref.reset_index(drop=True),
         "seq_target_mode": target_mode,
         "seq_build_attempts": build_attempts,
+        "device_calibration_summary": calib_summary,
         "seq_diagnostics": {
             "ignore_time_checks": bool(ignore_time_checks),
             "densify_step_ms": densify_step_ms,
@@ -1131,6 +1551,48 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
 
     # cached metrics + pointwise preds, but still build seq preds if checkpoints exist
     if run_id is not None and (not force_recompute) and all(map(exists, [p_results_pkl, p_preds])):
+        meta_path = artifact_path("fe", "seq_meta", run_id, "json")
+        if exists(meta_path):
+            seq_meta = load_json(meta_path)
+            cfg_cal_enabled = bool(_get_cfg(cfg, "device_calibration_enabled", False))
+            cfg_cal_quant = list(_get_cfg(cfg, "device_calibration_quantile_clip", (0.02, 0.98)))
+            cfg_cal_shrink = int(_get_cfg(cfg, "device_calibration_shrink_k", 100))
+            cfg_cal_scale_clip = list(_get_cfg(cfg, "device_calibration_scale_clip", (0.2, 5.0)))
+            cfg_cal_min_scale = float(_get_cfg(cfg, "device_calibration_min_scale", 1e-6))
+            cfg_norm_enabled = bool(_get_cfg(cfg, "fe_final_norm_enabled", True))
+            cfg_norm_by_device = bool(_get_cfg(cfg, "fe_final_norm_by_device", True))
+            cfg_align_enabled = bool(_get_cfg(cfg, "postproc_align_enabled", False))
+            cfg_align_min_points = int(_get_cfg(cfg, "postproc_align_min_points", 20))
+            cfg_align_prefix_points = int(_get_cfg(cfg, "postproc_align_prefix_points", 120))
+            cfg_align_allow_swap = bool(_get_cfg(cfg, "postproc_align_allow_swap", True))
+            cfg_align_min_ratio = float(_get_cfg(cfg, "postproc_align_min_improve_ratio", 0.15))
+            cfg_align_min_abs = float(_get_cfg(cfg, "postproc_align_min_improve_m", 0.5))
+            cfg_align_mode = str(_get_cfg(cfg, "postproc_align_mode", "auto"))
+            cfg_align_neg_eps = float(_get_cfg(cfg, "postproc_align_negative_eps", 0.2))
+            cfg_align_use_true = bool(_get_cfg(cfg, "postproc_align_use_true", False))
+            if (
+                seq_meta.get("device_calibration_enabled") != cfg_cal_enabled
+                or seq_meta.get("device_calibration_quantile_clip") != cfg_cal_quant
+                or seq_meta.get("device_calibration_shrink_k") != cfg_cal_shrink
+                or seq_meta.get("device_calibration_scale_clip") != cfg_cal_scale_clip
+                or seq_meta.get("device_calibration_min_scale") != cfg_cal_min_scale
+                or seq_meta.get("final_norm_enabled") != cfg_norm_enabled
+                or seq_meta.get("final_norm_by_device") != cfg_norm_by_device
+                or seq_meta.get("postproc_align_enabled") != cfg_align_enabled
+                or seq_meta.get("postproc_align_min_points") != cfg_align_min_points
+                or seq_meta.get("postproc_align_prefix_points") != cfg_align_prefix_points
+                or seq_meta.get("postproc_align_allow_swap") != cfg_align_allow_swap
+                or seq_meta.get("postproc_align_min_improve_ratio") != cfg_align_min_ratio
+                or seq_meta.get("postproc_align_min_improve_m") != cfg_align_min_abs
+                or seq_meta.get("postproc_align_mode") != cfg_align_mode
+                or seq_meta.get("postproc_align_negative_eps") != cfg_align_neg_eps
+                or seq_meta.get("postproc_align_use_true") != cfg_align_use_true
+            ):
+                force_recompute = True
+        else:
+            force_recompute = True
+
+    if run_id is not None and (not force_recompute) and all(map(exists, [p_results_pkl, p_preds])):
         metrics_df = load_joblib(p_results_pkl)
         preds_pack = load_npz(p_preds)
         preds_pointwise = _dict_npz_to_preds(preds_pack)
@@ -1163,6 +1625,8 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_speed_mps=max_speed_mps,
                                 max_dt_ms=max_dt_ms,
                             )
+                        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True)
+                        y_pred_pos, align = _maybe_align_by_calibration(y_pred_pos, align_ref, cfg=cfg)
                         preds_seq["LSTM_FE"] = _seq_pack(y_true_pos, y_pred_pos)
                         if use_kalman:
                             y_pred_pos_kf = _apply_kalman_by_group(
@@ -1172,6 +1636,7 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 process_var=kalman_process_var,
                                 meas_var=kalman_meas_var,
                             )
+                            y_pred_pos_kf = _apply_alignment_transform(y_pred_pos_kf, align)
                             preds_seq["LSTM_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
                     else:
                         if use_guardrails and df_test_base is not None:
@@ -1182,6 +1647,11 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_speed_mps=max_speed_mps,
                                 max_dt_ms=max_dt_ms,
                             )
+                        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True) if df_test_base is not None else None
+                        if align_ref is not None:
+                            y_pred, align = _maybe_align_by_calibration(y_pred, align_ref, cfg=cfg)
+                        else:
+                            align = None
                         preds_seq["LSTM_FE"] = _seq_pack(y_true, y_pred)
                         if use_kalman and df_test_base is not None:
                             y_pred_kf = _apply_kalman_by_group(
@@ -1191,6 +1661,7 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 process_var=kalman_process_var,
                                 meas_var=kalman_meas_var,
                             )
+                            y_pred_kf = _apply_alignment_transform(y_pred_kf, align)
                             preds_seq["LSTM_FE_KF"] = _seq_pack(y_true, y_pred_kf)
                 except RuntimeError:
                     cache_ok = False
@@ -1212,6 +1683,8 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_speed_mps=max_speed_mps,
                                 max_dt_ms=max_dt_ms,
                             )
+                        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True)
+                        y_pred_pos, align = _maybe_align_by_calibration(y_pred_pos, align_ref, cfg=cfg)
                         preds_seq["GRU_FE"] = _seq_pack(y_true_pos, y_pred_pos)
                         if use_kalman:
                             y_pred_pos_kf = _apply_kalman_by_group(
@@ -1221,6 +1694,7 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 process_var=kalman_process_var,
                                 meas_var=kalman_meas_var,
                             )
+                            y_pred_pos_kf = _apply_alignment_transform(y_pred_pos_kf, align)
                             preds_seq["GRU_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
                     else:
                         if use_guardrails and df_test_base is not None:
@@ -1231,6 +1705,11 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_speed_mps=max_speed_mps,
                                 max_dt_ms=max_dt_ms,
                             )
+                        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True) if df_test_base is not None else None
+                        if align_ref is not None:
+                            y_pred, align = _maybe_align_by_calibration(y_pred, align_ref, cfg=cfg)
+                        else:
+                            align = None
                         preds_seq["GRU_FE"] = _seq_pack(y_true, y_pred)
                         if use_kalman and df_test_base is not None:
                             y_pred_kf = _apply_kalman_by_group(
@@ -1240,6 +1719,7 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 process_var=kalman_process_var,
                                 meas_var=kalman_meas_var,
                             )
+                            y_pred_kf = _apply_alignment_transform(y_pred_kf, align)
                             preds_seq["GRU_FE_KF"] = _seq_pack(y_true, y_pred_kf)
                 except RuntimeError:
                     cache_ok = False
@@ -1277,6 +1757,8 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                 max_speed_mps=max_speed_mps,
                 max_dt_ms=max_dt_ms,
             )
+        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True)
+        y_pred_pos, align = _maybe_align_by_calibration(y_pred_pos, align_ref, cfg=cfg)
         rows.append(evaluate_regression(y_true_pos, y_pred_pos, "LSTM_FE", thresholds=thresholds))
         preds_pointwise["LSTM_FE"] = seq_preds_to_pointwise(y_pred_pos, idx_seq_test, n_total_test, agg="mean")
         preds_seq["LSTM_FE"] = _seq_pack(y_true_pos, y_pred_pos)
@@ -1288,6 +1770,7 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                 process_var=kalman_process_var,
                 meas_var=kalman_meas_var,
             )
+            y_pred_pos_kf = _apply_alignment_transform(y_pred_pos_kf, align)
             rows.append(evaluate_regression(y_true_pos, y_pred_pos_kf, "LSTM_FE_KF", thresholds=thresholds))
             preds_pointwise["LSTM_FE_KF"] = seq_preds_to_pointwise(y_pred_pos_kf, idx_seq_test, n_total_test, agg="mean")
             preds_seq["LSTM_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
@@ -1300,6 +1783,11 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                 max_speed_mps=max_speed_mps,
                 max_dt_ms=max_dt_ms,
             )
+        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True) if df_test_base is not None else None
+        if align_ref is not None:
+            y_pred, align = _maybe_align_by_calibration(y_pred, align_ref, cfg=cfg)
+        else:
+            align = None
         rows.append(evaluate_regression(y_true, y_pred, "LSTM_FE", thresholds=thresholds))
         preds_pointwise["LSTM_FE"] = seq_preds_to_pointwise(y_pred, idx_seq_test, n_total_test, agg="mean")
         preds_seq["LSTM_FE"] = _seq_pack(y_true, y_pred)
@@ -1332,6 +1820,8 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                 max_speed_mps=max_speed_mps,
                 max_dt_ms=max_dt_ms,
             )
+        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True)
+        y_pred_pos, align = _maybe_align_by_calibration(y_pred_pos, align_ref, cfg=cfg)
         rows.append(evaluate_regression(y_true_pos, y_pred_pos, "GRU_FE", thresholds=thresholds))
         preds_pointwise["GRU_FE"] = seq_preds_to_pointwise(y_pred_pos, idx_seq_test, n_total_test, agg="mean")
         preds_seq["GRU_FE"] = _seq_pack(y_true_pos, y_pred_pos)
@@ -1343,6 +1833,7 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                 process_var=kalman_process_var,
                 meas_var=kalman_meas_var,
             )
+            y_pred_pos_kf = _apply_alignment_transform(y_pred_pos_kf, align)
             rows.append(evaluate_regression(y_true_pos, y_pred_pos_kf, "GRU_FE_KF", thresholds=thresholds))
             preds_pointwise["GRU_FE_KF"] = seq_preds_to_pointwise(y_pred_pos_kf, idx_seq_test, n_total_test, agg="mean")
             preds_seq["GRU_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
@@ -1355,6 +1846,11 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                 max_speed_mps=max_speed_mps,
                 max_dt_ms=max_dt_ms,
             )
+        align_ref = df_test_base.loc[idx_seq_test].reset_index(drop=True) if df_test_base is not None else None
+        if align_ref is not None:
+            y_pred, align = _maybe_align_by_calibration(y_pred, align_ref, cfg=cfg)
+        else:
+            align = None
         rows.append(evaluate_regression(y_true, y_pred, "GRU_FE", thresholds=thresholds))
         preds_pointwise["GRU_FE"] = seq_preds_to_pointwise(y_pred, idx_seq_test, n_total_test, agg="mean")
         preds_seq["GRU_FE"] = _seq_pack(y_true, y_pred)

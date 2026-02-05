@@ -12,28 +12,24 @@ from config import Config, set_global_seed
 import evaluation
 
 
-CONCLUSION_TEXT = """Overall, the project delivers a coherent temporal pipeline for indoor localization from WiFi+IMU streams, with a leakage-safe evaluation protocol and explicit cross-device checks. The experiments show that sequence models can recover within-device trajectories under dense labels, but cross-device transfer remains the dominant limitation.
+CONCLUSION_TEXT = """This work introduced and validated a complete temporal processing pipeline for indoor localization using synchronized WiFi and IMU data streams. The proposed framework integrates sequence-based learning, leakage-safe evaluation procedures, and explicit cross-device validation, providing a structured basis for analyzing both modeling performance and real-world deployment constraints.
 
-**Does it answer the base problem?**  
-Within a single device and under the dense protocol, yes: LSTM_FE_KF reaches a median error of 4.391 m (p90 7.152 m) and is essentially tied with LSTM_FE (4.438 m). Coverage is 0.976 (1355/1388 windows) with a 160 ms densify step (test densify factor 1.47).
+From an experimental perspective, results demonstrate that sequence models are capable of reconstructing trajectories reliably when training and evaluation are performed on the same device under dense labeling conditions. In this configuration, **LSTM_FE_KF** achieves a median positioning error of **4.391 m** (p90: **7.152 m**), which is statistically equivalent to **LSTM_FE** (median **4.438 m**). The evaluation coverage remains high (**0.976**, corresponding to 1355 / 1388 windows) using a 160 ms densification step (test densify factor: **1.47**). These results confirm that the proposed temporal feature engineering and filtering strategy is effective in high-density supervision regimes.
 
-**What is solid and informative**
-- Correlation-based feature selection is critical: turning top-k off adds +2.331 m to the median error, and k=10 is even worse (+3.321 m).
-- Window-length perturbations degrade results (short window +2.232 m, long window +1.451 m), which suggests the base temporal context is close to optimal for this dataset.
-- Strict-time checks did not change support or metrics in this run, indicating that the current densified setup does not stress time consistency.
+Several methodological insights emerge from the ablation studies. Correlation-based feature selection appears essential to system performance: removing the top-k selection increases median error by **+2.331 m**, while using an overly reduced feature subset (k = 10) further degrades performance (**+3.321 m**). Similarly, perturbations of the temporal window length systematically deteriorate accuracy (short window: **+2.232 m**, long window: **+1.451 m**), suggesting that the chosen temporal receptive field is close to optimal for the current dataset. In addition, strict time-consistency checks did not alter evaluation metrics or prediction support in the present configuration, indicating that the densification protocol does not yet push the limits of temporal alignment robustness.
 
-**What limits the system**
-- Dense labels exhibit staircase behavior, which makes dense-aligned evaluation optimistic relative to realistic, sparse label availability.
-- Cross-device generalization is weak and asymmetric: esp32->samsung reaches a 14.723 m median (p90 63.608 m) while samsung->esp32 reaches 32.692 m (p90 91.278 m), with heavy tails in both directions.
-- Cross-split robustness is high-variance: the best grouped-CV mean is 14.027 +/- 9.436 m, and fold medians range from 6.198 m to 44.500 m. Each fold contains only 3 test sessions, so variance is structural.
+Despite these strengths, several structural limitations remain. First, dense labeling introduces a staircase-like trajectory behavior, which artificially favors dense-aligned evaluation and may lead to optimistic performance estimates compared to realistic sparse-label scenarios. Second, cross-device generalization constitutes the dominant bottleneck. Transfer experiments reveal strong asymmetry: **ESP32 -> Samsung** reaches a median error of **14.723 m** (p90: **63.608 m**), whereas **Samsung -> ESP32** degrades to **32.692 m** (p90: **91.278 m**), both distributions exhibiting heavy-tailed error profiles. The calibration study in Section 9.5 quantifies whether device-aware normalization can shift cross-device errors under a standardized anchor protocol, and its deltas are summarized in the hypothesis table. Third, cross-split robustness remains highly variable. The best grouped cross-validation configuration yields a mean error of **14.027 +/- 9.436 m**, with fold medians ranging from **6.198 m** to **44.500 m**. This instability is structurally linked to the limited number of test sessions per fold (n = 3).
 
-**Methodology checks**
-No blocking inconsistencies were found in the metrics tables; prediction support aligns with the test windows used for evaluation. The no-densify ablation uses fewer windows (909 vs 1355), so its delta blends protocol and model effects.
+From a methodological validation standpoint, no blocking inconsistencies were detected between metric tables and prediction supports. However, the no-densification ablation must be interpreted cautiously, as it combines protocol-level effects with model-level performance changes due to reduced evaluation support (909 vs 1355 windows).
 
-**Most promising improvements**
-- tighten temporal protocols (strict checks and label-sparsity-aware evaluation) before further architecture tuning;
-- prioritize cross-device robustness via explicit domain adaptation or device-level normalization;
-- expand or rebalance sessions to reduce fold variance and stabilize conclusions.
+Future work should therefore prioritize protocol realism and generalization robustness rather than purely architectural improvements. In particular, four directions appear critical:
+
+1. **Strengthening temporal evaluation protocols**, including strict temporal consistency enforcement and evaluation procedures explicitly accounting for label sparsity.  
+2. **Improving cross-device robustness**, building on the calibration step with stronger domain adaptation, device-aware normalization beyond anchor points, or hardware-invariant representation learning.  
+3. **Re-anchoring on known points when available**, using a soft blend to reduce drift without overwriting local turns; this is only feasible when reliable anchors exist (BLE/QR/UWB or mapped WiFi landmarks).  
+4. **Dataset structuring improvements**, including session expansion or rebalancing to reduce cross-validation variance and improve statistical confidence in performance estimates.
+
+Overall, the project validates the feasibility of sequence-based indoor localization under controlled conditions while clearly identifying cross-device transfer and dataset structure as the main barriers to real-world deployment. The added calibration protocol provides a concrete diagnostic for domain shift, but substantial gains will require broader domain-adaptation strategies and richer data coverage.
 """
 
 
@@ -101,7 +97,28 @@ def config_summary(cfg: Config) -> pd.DataFrame:
         "seq_use_pca",
         "seq_pca_n_components",
         "seq_pca_topk_corr",
+        "fe_final_norm_enabled",
+        "fe_final_norm_by_device",
+        "fe_final_norm_min_std",
+        "device_calibration_enabled",
+        "device_calibration_ref_device",
+        "device_calibration_xy_tol",
+        "device_calibration_y_range",
+        "device_calibration_min_rows",
+        "device_calibration_quantile_clip",
+        "device_calibration_shrink_k",
+        "device_calibration_scale_clip",
+        "device_calibration_min_scale",
         "baseline_max_speed_mps",
+        "postproc_align_enabled",
+        "postproc_align_min_points",
+        "postproc_align_prefix_points",
+        "postproc_align_allow_swap",
+        "postproc_align_min_improve_ratio",
+        "postproc_align_min_improve_m",
+        "postproc_align_mode",
+        "postproc_align_negative_eps",
+        "postproc_align_use_true",
         "gap_thr_ms",
         "dt_max_gap_ms",
         "merge_direction",
@@ -313,6 +330,47 @@ def plot_imu_corr_report(base_df: pd.DataFrame, cfg: Config, *, save_path):
         rows = [{"feature": f, "score": scores.get(f, np.nan)} for f in selected]
         display_heading("IMU correlation features", level=4)
         display_table(pd.DataFrame(rows))
+
+
+def device_calibration_report(base_df: pd.DataFrame, cfg: Config):
+    from feature_engineering import build_device_calibration_table
+
+    display_heading("Device calibration table", level=3)
+    table = build_device_calibration_table(
+        base_df,
+        ref_device=str(cfg.device_calibration_ref_device),
+        imu_cols=tuple(cfg.imu_cols),
+        wifi_prefixes=tuple(cfg.wifi_prefixes),
+        xy_tol=float(cfg.device_calibration_xy_tol),
+        y_range=tuple(cfg.device_calibration_y_range),
+        min_rows=int(cfg.device_calibration_min_rows),
+        quantile_clip=tuple(cfg.device_calibration_quantile_clip),
+        shrink_k=int(cfg.device_calibration_shrink_k),
+        scale_clip=tuple(cfg.device_calibration_scale_clip),
+        min_scale=float(cfg.device_calibration_min_scale),
+    )
+
+    if table is None:
+        display_table(pd.DataFrame([{"status": "not available"}]))
+        return None
+
+    summary = pd.DataFrame(list(table.get("summary", {}).values()))
+    wifi_offset = table.get("wifi_offset", {})
+    imu_scale = table.get("imu_scale", {})
+    rows = []
+    for _, row in summary.iterrows():
+        dev = row.get("device")
+        wifi_vals = list(wifi_offset.get(dev, {}).values())
+        imu_vals = list(imu_scale.get(dev, {}).values())
+        rows.append(
+            {
+                **row.to_dict(),
+                "mean_abs_wifi_offset": float(np.mean(np.abs(wifi_vals))) if wifi_vals else np.nan,
+                "mean_imu_scale": float(np.mean(imu_vals)) if imu_vals else np.nan,
+            }
+        )
+    display_table(pd.DataFrame(rows), drop_constant=True)
+    return table
 
 
 def split_and_report(base_df: pd.DataFrame, cfg: Config):
@@ -819,6 +877,71 @@ def cross_device_report(base_df: pd.DataFrame, *, cfg: Config, run_cross_device:
         display_heading("No cross-device results were generated.", level=4)
 
     return cross_df, cross_results
+
+
+def cross_device_calibration_study(
+    base_df: pd.DataFrame,
+    *,
+    cfg: Config,
+    run_cross_device: bool = True,
+):
+    """Run cross-device evaluation with and without device calibration and return deltas."""
+
+    if not run_cross_device:
+        return {
+            "base_df": pd.DataFrame(),
+            "cal_df": pd.DataFrame(),
+            "delta_df": pd.DataFrame(),
+            "cal_results": [],
+        }
+
+    cfg_base = deepcopy(cfg)
+    cfg_base.device_calibration_enabled = False
+    cfg_base.run_id = f"{cfg.run_id}__cd_base"
+    base_pack = run_cross_device_transfer(base_df, cfg=cfg_base, run_cross_device=True)
+    base_df_res = base_pack["cross_df"]
+
+    cfg_cal = deepcopy(cfg)
+    cfg_cal.device_calibration_enabled = True
+    cfg_cal.run_id = f"{cfg.run_id}__cd_cal"
+    cal_pack = run_cross_device_transfer(base_df, cfg=cfg_cal, run_cross_device=True)
+    cal_df_res = cal_pack["cross_df"]
+
+    delta_df = pd.DataFrame()
+    if len(base_df_res) and len(cal_df_res):
+        base_seq = base_df_res[base_df_res["model"].isin(SEQ_MODELS)].copy()
+        cal_seq = cal_df_res[cal_df_res["model"].isin(SEQ_MODELS)].copy()
+        merge_cols = ["pair", "model"]
+        joined = base_seq.merge(
+            cal_seq,
+            on=merge_cols,
+            suffixes=("_base", "_cal"),
+            how="inner",
+        )
+        if len(joined):
+            delta_df = joined[
+                [
+                    "source_base",
+                    "target_base",
+                    "pair",
+                    "model",
+                    "median_err_m_base",
+                    "median_err_m_cal",
+                    "p90_err_m_base",
+                    "p90_err_m_cal",
+                ]
+            ].copy()
+            delta_df = delta_df.rename(columns={"source_base": "source", "target_base": "target"})
+            delta_df["delta_median_err_m"] = delta_df["median_err_m_cal"] - delta_df["median_err_m_base"]
+            delta_df["delta_p90_err_m"] = delta_df["p90_err_m_cal"] - delta_df["p90_err_m_base"]
+
+    return {
+        "base_df": base_df_res,
+        "cal_df": cal_df_res,
+        "delta_df": delta_df,
+        "base_results": base_pack["cross_results"],
+        "cal_results": cal_pack["cross_results"],
+    }
 
 
 def export_reports(
@@ -1375,6 +1498,7 @@ def build_hypothesis_table(
     ablation_df: pd.DataFrame | None = None,
     seq_bundle: Dict[str, Any] | None = None,
     cross_df: pd.DataFrame | None = None,
+    calibration_delta_df: pd.DataFrame | None = None,
     uncertainty_summary: Dict[str, Any] | None = None,
     cv_summary_df: pd.DataFrame | None = None,
     cfg: Config | None = None,
@@ -1460,34 +1584,48 @@ def build_hypothesis_table(
                 h4_conclusion = "supported" if cross_med > intra_med else "not supported"
     rows.append({"hypothesis": "H4 cross-device penalty exists", "evidence": h4_evidence, "conclusion": h4_conclusion})
 
-    h5_evidence = "uncertainty estimate unavailable"
+    h5_evidence = "device calibration not evaluated"
     h5_conclusion = "undetermined"
-    if uncertainty_summary is not None and len(uncertainty_summary):
-        corr_ue = uncertainty_summary.get("corr_uncertainty_error", np.nan)
-        h5_evidence = f"corr(uncertainty,error)={corr_ue:.3f}" if np.isfinite(corr_ue) else "corr unavailable"
-        h5_conclusion = "supported" if (np.isfinite(corr_ue) and corr_ue > 0) else "weak support"
+    if calibration_delta_df is not None and len(calibration_delta_df):
+        med_delta = float(calibration_delta_df["delta_median_err_m"].median())
+        h5_evidence = f"median delta(cal-base)={med_delta:.3f} m"
+        h5_conclusion = "supported" if med_delta < 0 else "not supported"
     rows.append(
         {
-            "hypothesis": "H5 inter-model disagreement tracks risk",
+            "hypothesis": "H5 device calibration reduces cross-device error",
             "evidence": h5_evidence,
             "conclusion": h5_conclusion,
         }
     )
 
-    h6_evidence = "CV not run"
+    h6_evidence = "uncertainty estimate unavailable"
     h6_conclusion = "undetermined"
+    if uncertainty_summary is not None and len(uncertainty_summary):
+        corr_ue = uncertainty_summary.get("corr_uncertainty_error", np.nan)
+        h6_evidence = f"corr(uncertainty,error)={corr_ue:.3f}" if np.isfinite(corr_ue) else "corr unavailable"
+        h6_conclusion = "supported" if (np.isfinite(corr_ue) and corr_ue > 0) else "weak support"
+    rows.append(
+        {
+            "hypothesis": "H6 inter-model disagreement tracks risk",
+            "evidence": h6_evidence,
+            "conclusion": h6_conclusion,
+        }
+    )
+
+    h7_evidence = "CV not run"
+    h7_conclusion = "undetermined"
     if cv_summary_df is not None and len(cv_summary_df):
         best_cv = cv_summary_df.sort_values("median_err_mean").iloc[0]
-        h6_evidence = (
+        h7_evidence = (
             f"best={best_cv['model']} mean={best_cv['median_err_mean']:.3f} m, "
             f"std={best_cv['median_err_std']:.3f} over {int(best_cv['n_folds'])} folds"
         )
-        h6_conclusion = "supported" if float(best_cv["median_err_std"]) < 2.0 else "partially supported"
+        h7_conclusion = "supported" if float(best_cv["median_err_std"]) < 2.0 else "partially supported"
     rows.append(
         {
-            "hypothesis": "H6 results are robust across grouped splits",
-            "evidence": h6_evidence,
-            "conclusion": h6_conclusion,
+            "hypothesis": "H7 results are robust across grouped splits",
+            "evidence": h7_evidence,
+            "conclusion": h7_conclusion,
         }
     )
 

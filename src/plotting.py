@@ -839,6 +839,190 @@ def plot_cross_device_heatmaps(
     return plotted
 
 
+def plot_cross_device_calibration_delta(
+    delta_df: pd.DataFrame,
+    *,
+    metric: str = "delta_median_err_m",
+    title: str = "Calibration impact (delta error)",
+    save_path: Path | None = None,
+) -> bool:
+    """Plot a heatmap of calibration deltas by source/target device."""
+
+    if delta_df is None or len(delta_df) == 0:
+        return False
+    if "source" not in delta_df.columns or "target" not in delta_df.columns:
+        return False
+    if metric not in delta_df.columns:
+        return False
+
+    mat = (
+        delta_df.groupby(["source", "target"], as_index=False)[metric]
+        .median()
+        .pivot(index="source", columns="target", values=metric)
+    )
+    if mat.empty:
+        return False
+
+    plt.figure(figsize=(5, 4))
+    if sns is not None:
+        sns.heatmap(mat, annot=True, fmt=".2f", cmap="coolwarm", center=0, square=True)
+    else:
+        plt.imshow(mat.values, cmap="coolwarm")
+        plt.xticks(range(len(mat.columns)), mat.columns, rotation=30, ha="right")
+        plt.yticks(range(len(mat.index)), mat.index)
+        plt.colorbar(label=metric)
+    plt.title(title)
+    plt.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=160)
+    plt.show(block=False)
+    return True
+
+
+def plot_cross_device_calibration_snippet(
+    base_results: List[Dict],
+    cal_results: List[Dict],
+    base_df: pd.DataFrame,
+    cal_df: pd.DataFrame,
+    *,
+    save_dir: Path | None = None,
+    run_id: str | None = None,
+    n_points: int = 120,
+) -> List[str]:
+    """Plot a short cross-device trajectory snippet before/after calibration."""
+
+    if not cal_results or cal_df is None or len(cal_df) == 0:
+        return []
+
+    seq_models = {"LSTM_FE", "LSTM_FE_KF", "GRU_FE", "GRU_FE_KF"}
+
+    def _select_indices(pack: Dict) -> np.ndarray:
+        y_true = np.asarray(pack.get("y_true"), dtype=float)
+        n = len(y_true)
+        idx = np.arange(n)
+        sid = pack.get("session_id")
+        seg = pack.get("segment_id")
+        tms = pack.get("t_ms")
+        if sid is not None and seg is not None and len(np.asarray(sid)) == n and len(np.asarray(seg)) == n:
+            meta = pd.DataFrame(
+                {
+                    "idx": np.arange(n),
+                    "sid": np.asarray(sid)[:n],
+                    "seg": np.asarray(seg)[:n],
+                }
+            )
+            if tms is not None and len(np.asarray(tms)) == n:
+                meta["t"] = np.asarray(tms)[:n]
+            largest = meta.groupby(["sid", "seg"]).size().sort_values(ascending=False)
+            if len(largest):
+                sid0, seg0 = largest.index[0]
+                sub = meta[(meta["sid"] == sid0) & (meta["seg"] == seg0)].copy()
+                sub = sub.sort_values("t") if "t" in sub.columns else sub.sort_values("idx")
+                idx = sub["idx"].to_numpy(dtype=int)
+        if n_points is not None and n_points > 0 and len(idx) > n_points:
+            idx = idx[:n_points]
+        return idx
+
+    pair_list = sorted(set((d.get("source"), d.get("target")) for d in cal_results if d.get("source") and d.get("target")))
+    plotted_pairs: List[str] = []
+
+    for src, tgt in pair_list:
+        cal_pair_df = cal_df[(cal_df["source"] == src) & (cal_df["target"] == tgt)]
+        base_pair_df = (
+            base_df[(base_df["source"] == src) & (base_df["target"] == tgt)] if base_df is not None else pd.DataFrame()
+        )
+        if cal_pair_df.empty:
+            continue
+        cal_pair_df = cal_pair_df[cal_pair_df["model"].isin(seq_models)]
+        base_pair_df = base_pair_df[base_pair_df["model"].isin(seq_models)]
+        if cal_pair_df.empty:
+            continue
+
+        ref_model = cal_pair_df.sort_values("median_err_m").iloc[0]["model"]
+        if len(base_pair_df):
+            ref_model = base_pair_df.sort_values("median_err_m").iloc[0]["model"]
+
+        cal_pack = next(
+            (d for d in cal_results if d.get("source") == src and d.get("target") == tgt and d.get("model") == ref_model),
+            None,
+        )
+        if cal_pack is None:
+            continue
+        base_pack = None
+        if base_results:
+            base_pack = next(
+                (
+                    d
+                    for d in base_results
+                    if d.get("source") == src and d.get("target") == tgt and d.get("model") == ref_model
+                ),
+                None,
+            )
+
+        idx = _select_indices(cal_pack)
+        if len(idx) < 10:
+            continue
+
+        y_true = np.asarray(cal_pack.get("y_true"), dtype=float)
+        true_xy = y_true[idx]
+        if not np.isfinite(true_xy).all():
+            mask = np.isfinite(true_xy).all(axis=1)
+            true_xy = true_xy[mask]
+            idx = idx[mask]
+        if len(true_xy) < 10:
+            continue
+
+        n_cols = 2 if base_pack is not None else 1
+        fig, axes = plt.subplots(1, n_cols, figsize=(6.5 * n_cols, 5), squeeze=False)
+        axes = axes[0]
+
+        def _plot_one(ax, pack: Dict, title: str, color: str):
+            y_pred = np.asarray(pack.get("y_pred"), dtype=float)
+            valid_idx = idx[idx < len(y_pred)]
+            if len(valid_idx) < 10:
+                ax.set_axis_off()
+                return False
+            pred_xy = y_pred[valid_idx]
+            mask = np.isfinite(pred_xy).all(axis=1)
+            pred_xy = pred_xy[mask]
+            if len(pred_xy) < 10:
+                ax.set_axis_off()
+                return False
+            ax.plot(true_xy[:, 0], true_xy[:, 1], color="black", linewidth=2.2, label="True", zorder=3)
+            ax.plot(pred_xy[:, 0], pred_xy[:, 1], color=color, linewidth=2.0, label=title, zorder=2)
+            ax.set_title(title)
+            ax.set_xlabel("X (m)")
+            ax.set_ylabel("Y (m)")
+            ax.grid(True, alpha=0.35)
+            ax.set_aspect("equal", adjustable="box")
+            ax.legend(loc="best", frameon=True)
+            return True
+
+        any_plot = False
+        col = 0
+        if base_pack is not None:
+            any_plot |= _plot_one(axes[col], base_pack, f"Base ({ref_model})", "tab:red")
+            col += 1
+        any_plot |= _plot_one(axes[col], cal_pack, f"Calibrated ({ref_model})", "tab:green")
+
+        if not any_plot:
+            plt.close(fig)
+            continue
+
+        fig.suptitle(f"Calibration snippet - {src} -> {tgt} (n={len(idx)})", y=1.02)
+        plt.tight_layout()
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            suffix = f"__{run_id}" if run_id else ""
+            out = save_dir / f"cross_device_calibration_snippet_{src}_to_{tgt}{suffix}.png"
+            plt.savefig(out, dpi=160)
+        plt.show(block=False)
+        plotted_pairs.append(f"{src}->{tgt}")
+
+    return plotted_pairs
+
+
 def display_cross_device_tables_and_heatmaps(cross_df: pd.DataFrame, *, save_path: Path | None = None):
     from IPython.display import display
 
