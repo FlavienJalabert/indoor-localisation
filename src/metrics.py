@@ -6,7 +6,6 @@ from typing import Dict, Tuple
 
 import numpy as np
 
-
 def evaluate_regression(
     y_true: np.ndarray,
     y_pred: np.ndarray,

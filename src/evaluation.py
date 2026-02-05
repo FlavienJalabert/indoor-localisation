@@ -9,7 +9,9 @@ No plotting here.
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+import warnings
+from copy import deepcopy
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,7 +20,7 @@ from torch.utils.data import DataLoader
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from config import Config
+from config import Config, set_global_seed
 from artifacts import (
     artifact_path,
     exists,
@@ -40,7 +42,7 @@ from tabular_models import (
     predict_xy_from_xgb,
 )
 from metrics import evaluate_regression
-from splitting import add_session_id, group_split_train_val
+from splitting import add_session_id, group_split, group_split_train_val
 from seq_training import (
     build_sequences,
     TrajDataset,
@@ -501,16 +503,7 @@ def prepare_tabular_xy(
 
 
 def eval_tabular_models(bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
-    """Train/evaluate tabular models and return metrics and predictions.
-
-    NOTE: caching uses cfg.run_id if present? We don't have run_id in signature,
-    so we rely on cfg to expose `run_id` OR you handle caching in notebook by calling
-    this only when needed.
-
-    Recommended: add run_id + force_recompute to signature later.
-    For now: no caching here (or minimal caching with cfg.run_id if present).
-    """
-    # You chose signature without run_id/force_recompute; we still can cache via cfg if present.
+    """Train/evaluate tabular models and return metrics and predictions."""
     run_id = getattr(cfg, "run_id", None)
     force_recompute = bool(getattr(cfg, "force_recompute", False))
 
@@ -697,37 +690,6 @@ def prepare_seq_data(
         verbose=False,
     )
 
-    # Optional: use only true anchor points as sequence targets to avoid staircase labels from asof-nearest.
-    use_anchor_points = bool(_get_cfg(cfg, "seq_use_anchor_points", True))
-    gap_thr_ms = _get_cfg(cfg, "gap_thr_ms", 1000.0)
-    gap_thr_ms = float(gap_thr_ms) if gap_thr_ms is not None else None
-    min_points = max(20, int(_get_cfg(cfg, "window_size", 20)) * 2)
-
-    def _subset_anchor_points(df_fe: pd.DataFrame, X_num: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        if not use_anchor_points:
-            return df_fe, X_num
-        if not {"anchor_X", "anchor_Y"}.issubset(df_fe.columns):
-            return df_fe, X_num
-        m = np.isfinite(df_fe["anchor_X"].to_numpy(dtype=float)) & np.isfinite(df_fe["anchor_Y"].to_numpy(dtype=float))
-        if int(m.sum()) < min_points:
-            return df_fe, X_num
-        d = df_fe.loc[m].copy()
-        x = X_num.loc[m].copy()
-        d["__rid"] = np.arange(len(d), dtype=int)
-        d["label_X"] = d["anchor_X"].astype(float)
-        d["label_Y"] = d["anchor_Y"].astype(float)
-        if {"session_id", "t_ms"}.issubset(d.columns) and gap_thr_ms is not None:
-            d = d.sort_values(["session_id", "t_ms"], kind="mergesort").reset_index(drop=True)
-            x = x.iloc[d["__rid"].to_numpy(dtype=int)].reset_index(drop=True)
-            dt = d.groupby("session_id")["t_ms"].diff()
-            d["segment_id"] = (dt.isna() | (dt > gap_thr_ms)).groupby(d["session_id"]).cumsum().astype(int)
-        d = d.drop(columns=["__rid"]).reset_index(drop=True)
-        x = x.reset_index(drop=True)
-        return d, x
-
-    df_train_fe, X_train_num = _subset_anchor_points(df_train_fe, X_train_num)
-    df_test_fe, X_test_num = _subset_anchor_points(df_test_fe, X_test_num)
-
     # Optional PCA on top correlated numeric features (train-only)
     use_pca = bool(_get_cfg(cfg, "seq_use_pca", False))
     pca_n = int(_get_cfg(cfg, "seq_pca_n_components", int(_get_cfg(cfg, "top_k", 20))))
@@ -742,10 +704,26 @@ def prepare_seq_data(
         if s.isna().all():
             return None
         try:
-            corr_x = np.corrcoef(s.fillna(0.0), df_train_fe["label_X"].to_numpy())[0, 1]
-            corr_y = np.corrcoef(s.fillna(0.0), df_train_fe["label_Y"].to_numpy())[0, 1]
-            score = np.nanmean([abs(corr_x), abs(corr_y)])
-            return float(score) if not np.isnan(score) else None
+            x = s.to_numpy(dtype=float)
+            yx = df_train_fe["label_X"].to_numpy(dtype=float)
+            yy = df_train_fe["label_Y"].to_numpy(dtype=float)
+
+            def _safe_corr(a: np.ndarray, b: np.ndarray) -> float | None:
+                mask = np.isfinite(a) & np.isfinite(b)
+                if int(mask.sum()) < 2:
+                    return None
+                aa = a[mask]
+                bb = b[mask]
+                if float(np.nanstd(aa)) < 1e-12 or float(np.nanstd(bb)) < 1e-12:
+                    return None
+                return float(np.corrcoef(aa, bb)[0, 1])
+
+            corr_x = _safe_corr(x, yx)
+            corr_y = _safe_corr(x, yy)
+            vals = [abs(c) for c in [corr_x, corr_y] if c is not None and np.isfinite(c)]
+            if not vals:
+                return None
+            return float(np.mean(vals))
         except Exception:
             return None
 
@@ -832,6 +810,8 @@ def prepare_seq_data(
         ],
         axis=1,
     )
+    n_train_rows_pre_densify = int(len(train_tab))
+    n_test_rows_pre_densify = int(len(test_tab))
 
     # Optional densification on a regular time grid to increase sequence count.
     densify_step_ms = _get_cfg(cfg, "seq_densify_step_ms", None)
@@ -874,6 +854,8 @@ def prepare_seq_data(
 
     train_tab = _densify_tab(train_tab)
     test_tab = _densify_tab(test_tab)
+    n_train_rows_post_densify = int(len(train_tab))
+    n_test_rows_post_densify = int(len(test_tab))
     df_test_ref = test_tab[["device", "motion", "session_id", "segment_id", "label_X", "label_Y", time_col]].copy()
 
     train_ohe = pd.get_dummies(train_tab, columns=["device", "motion"], drop_first=True)
@@ -917,9 +899,11 @@ def prepare_seq_data(
     max_window_ms_cfg = float(max_window_ms_cfg) if max_window_ms_cfg is not None else None
 
     ignore_time_checks = bool(_get_cfg(cfg, "seq_ignore_time_checks", True))
+    n_total_test = int(len(df_test_ref))
+    build_attempts: list[Dict] = []
 
     def _build_for_window(w: int, dt_limit: float | None, win_limit: float | None):
-        xtr, ytr, itr = build_sequences(
+        xtr, ytr, itr, st_tr = build_sequences(
             train_ohe,
             feature_cols_seq,
             window_size=w,
@@ -930,8 +914,9 @@ def prepare_seq_data(
             max_dt_ms=dt_limit,
             max_window_ms=win_limit,
             enforce_time_checks=not ignore_time_checks,
+            return_stats=True,
         )
-        xte, yte, ite = build_sequences(
+        xte, yte, ite, st_te = build_sequences(
             test_ohe,
             feature_cols_seq,
             window_size=w,
@@ -942,6 +927,19 @@ def prepare_seq_data(
             max_dt_ms=dt_limit,
             max_window_ms=win_limit,
             enforce_time_checks=not ignore_time_checks,
+            return_stats=True,
+        )
+        build_attempts.append(
+            {
+                "window_size": int(w),
+                "max_dt_ms": None if dt_limit is None else float(dt_limit),
+                "max_window_ms": None if win_limit is None else float(win_limit),
+                "n_train_windows": int(len(itr)),
+                "n_test_windows": int(len(ite)),
+                "coverage": float(len(ite) / max(1, n_total_test)),
+                "train_stats": st_tr,
+                "test_stats": st_te,
+            }
         )
         return xtr, ytr, itr, xte, yte, ite
 
@@ -950,7 +948,6 @@ def prepare_seq_data(
     )
 
     # If too strict, progressively relax constraints and shrink window.
-    n_total_test = int(len(df_test_ref))
     while True:
         has_data = (X_train_seqs.size > 0) and (X_test_seqs.size > 0)
         coverage = (len(idx_test) / max(1, n_total_test))
@@ -1032,6 +1029,13 @@ def prepare_seq_data(
                 "window_size_effective": int(window_size),
                 "ignore_time_checks": bool(ignore_time_checks),
                 "densify_step_ms": densify_step_ms,
+                "n_train_rows_pre_densify": n_train_rows_pre_densify,
+                "n_test_rows_pre_densify": n_test_rows_pre_densify,
+                "n_train_rows_post_densify": n_train_rows_post_densify,
+                "n_test_rows_post_densify": n_test_rows_post_densify,
+                "train_densify_factor": float(n_train_rows_post_densify / max(1, n_train_rows_pre_densify)),
+                "test_densify_factor": float(n_test_rows_post_densify / max(1, n_test_rows_pre_densify)),
+                "build_attempts": build_attempts,
             },
             p_meta,
         )
@@ -1049,16 +1053,24 @@ def prepare_seq_data(
         "window_size_effective": int(window_size),
         "df_test_fe": df_test_ref.reset_index(drop=True),
         "seq_target_mode": target_mode,
+        "seq_build_attempts": build_attempts,
+        "seq_diagnostics": {
+            "ignore_time_checks": bool(ignore_time_checks),
+            "densify_step_ms": densify_step_ms,
+            "n_train_rows_pre_densify": n_train_rows_pre_densify,
+            "n_test_rows_pre_densify": n_test_rows_pre_densify,
+            "n_train_rows_post_densify": n_train_rows_post_densify,
+            "n_test_rows_post_densify": n_test_rows_post_densify,
+            "train_densify_factor": float(n_train_rows_post_densify / max(1, n_train_rows_pre_densify)),
+            "test_densify_factor": float(n_test_rows_post_densify / max(1, n_test_rows_pre_densify)),
+        },
         "run_id": run_id,
         "force_recompute": force_recompute,
     }
 
 
 def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dict, Dict]:
-    """Train/evaluate sequence models and return metrics and pointwise preds.
-
-    Same note as tabular: signature lacks run_id/force_recompute. We fallback to cfg.run_id/cfg.force_recompute if present.
-    """
+    """Train/evaluate sequence models and return metrics and pointwise preds."""
     run_id = seq_bundle.get("run_id", getattr(cfg, "run_id", None))
     force_recompute = bool(seq_bundle.get("force_recompute", getattr(cfg, "force_recompute", False)))
 
@@ -1098,9 +1110,6 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                 pack["session_id"] = ref["session_id"].to_numpy()
             if "segment_id" in ref.columns:
                 pack["segment_id"] = ref["segment_id"].to_numpy()
-            if "anchor_X" in ref.columns and "anchor_Y" in ref.columns:
-                pack["anchor_X"] = ref["anchor_X"].to_numpy(dtype=float)
-                pack["anchor_Y"] = ref["anchor_Y"].to_numpy(dtype=float)
         return pack
 
     # infer input dim D
@@ -1155,6 +1164,15 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_dt_ms=max_dt_ms,
                             )
                         preds_seq["LSTM_FE"] = _seq_pack(y_true_pos, y_pred_pos)
+                        if use_kalman:
+                            y_pred_pos_kf = _apply_kalman_by_group(
+                                y_pred_pos,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                process_var=kalman_process_var,
+                                meas_var=kalman_meas_var,
+                            )
+                            preds_seq["LSTM_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
                     else:
                         if use_guardrails and df_test_base is not None:
                             y_pred = _stabilize_predictions_by_group(
@@ -1165,6 +1183,15 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_dt_ms=max_dt_ms,
                             )
                         preds_seq["LSTM_FE"] = _seq_pack(y_true, y_pred)
+                        if use_kalman and df_test_base is not None:
+                            y_pred_kf = _apply_kalman_by_group(
+                                y_pred,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                process_var=kalman_process_var,
+                                meas_var=kalman_meas_var,
+                            )
+                            preds_seq["LSTM_FE_KF"] = _seq_pack(y_true, y_pred_kf)
                 except RuntimeError:
                     cache_ok = False
 
@@ -1186,6 +1213,15 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_dt_ms=max_dt_ms,
                             )
                         preds_seq["GRU_FE"] = _seq_pack(y_true_pos, y_pred_pos)
+                        if use_kalman:
+                            y_pred_pos_kf = _apply_kalman_by_group(
+                                y_pred_pos,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                process_var=kalman_process_var,
+                                meas_var=kalman_meas_var,
+                            )
+                            preds_seq["GRU_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
                     else:
                         if use_guardrails and df_test_base is not None:
                             y_pred = _stabilize_predictions_by_group(
@@ -1196,6 +1232,15 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
                                 max_dt_ms=max_dt_ms,
                             )
                         preds_seq["GRU_FE"] = _seq_pack(y_true, y_pred)
+                        if use_kalman and df_test_base is not None:
+                            y_pred_kf = _apply_kalman_by_group(
+                                y_pred,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                process_var=kalman_process_var,
+                                meas_var=kalman_meas_var,
+                            )
+                            preds_seq["GRU_FE_KF"] = _seq_pack(y_true, y_pred_kf)
                 except RuntimeError:
                     cache_ok = False
 
@@ -1444,7 +1489,6 @@ def session_analysis_device_motion(
     *,
     cfg: Config,
     min_points_per_session: int = 50,
-    top_k_worst_sessions: int = 5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Compute per-session diagnostics and p95 pivot table.
 
@@ -1502,3 +1546,393 @@ def session_analysis_device_motion(
             p95_pivot.to_csv(p_pivot, index=False)
 
     return session_df_long, p95_pivot
+
+
+# -------------------------
+# RIGOR + DIAGNOSTICS HELPERS
+# -------------------------
+
+def classify_model_protocol(model_name: str) -> Dict[str, str]:
+    """Classify model role for fair reporting (sequential/baseline and deployable/oracle)."""
+
+    name = str(model_name)
+    low = name.lower()
+
+    if low.startswith("baseline_"):
+        family = "baseline"
+        if "oracle" in low or "last_position" in low:
+            deployment = "oracle"
+        elif "rollout" in low:
+            deployment = "deployable"
+        else:
+            deployment = "unknown_baseline"
+    elif ("lstm" in low) or ("gru" in low):
+        family = "sequential_dl"
+        deployment = "deployable"
+    else:
+        family = "other_model"
+        deployment = "unknown"
+
+    return {
+        "model_family": family,
+        "deployment_mode": deployment,
+    }
+
+
+def evaluate_predictions_protocols(
+    df_ref: pd.DataFrame,
+    preds_by_model: Dict[str, np.ndarray],
+    *,
+    thresholds: Tuple[float, ...] = (0.25, 0.5, 1.0, 2.0),
+    dense_target_cols: Tuple[str, str] = ("label_X", "label_Y"),
+    min_points: int = 20,
+) -> pd.DataFrame:
+    """Evaluate predictions under the dense-aligned protocol."""
+
+    _require_cols(df_ref, list(dense_target_cols), "df_ref")
+
+    df = df_ref.reset_index(drop=True).copy()
+    y_true_dense = df[list(dense_target_cols)].to_numpy(dtype=float)
+
+    rows = []
+    n_total = int(len(df))
+    for model_name, y_pred in preds_by_model.items():
+        yp = np.asarray(y_pred, dtype=float)
+        if yp.ndim != 2 or yp.shape[1] != 2 or yp.shape[0] != n_total:
+            continue
+
+        proto = classify_model_protocol(model_name)
+
+        # Protocol A: dense aligned labels (current main benchmark)
+        mask_dense = np.isfinite(y_true_dense).all(axis=1) & np.isfinite(yp).all(axis=1)
+        if int(mask_dense.sum()) >= min_points:
+            r_dense = evaluate_regression(
+                y_true_dense[mask_dense],
+                yp[mask_dense],
+                name=str(model_name),
+                thresholds=thresholds,
+            )
+            r_dense.update(
+                {
+                    "protocol": "dense_aligned",
+                    "n_eval": int(mask_dense.sum()),
+                    "coverage_eval": float(mask_dense.mean()),
+                    **proto,
+                }
+            )
+            rows.append(r_dense)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["protocol", "median_err_m", "model"], kind="mergesort").reset_index(drop=True)
+
+
+def failure_analysis_by_context(
+    df_ref: pd.DataFrame,
+    preds_by_model: Dict[str, np.ndarray],
+    *,
+    time_col: str = "t_ms",
+    dt_bins_ms: Tuple[float, ...] = (0.0, 120.0, 200.0, 350.0, 700.0, 1000.0, 2000.0, 1e12),
+    min_points: int = 20,
+) -> Dict[str, pd.DataFrame]:
+    """Build systematic error diagnostics by context (device/motion/session/gap)."""
+
+    _require_cols(df_ref, ["label_X", "label_Y"], "df_ref")
+    df = df_ref.reset_index(drop=True).copy()
+    if "session_id" not in df.columns:
+        df = add_session_id(df)
+    if "segment_id" not in df.columns:
+        df["segment_id"] = 0
+    if "device" not in df.columns:
+        df["device"] = "unknown"
+    if "motion" not in df.columns:
+        df["motion"] = "unknown"
+
+    if time_col in df.columns:
+        df["dt_ms"] = (
+            df.sort_values(["session_id", "segment_id", time_col], kind="mergesort")
+            .groupby(["session_id", "segment_id"])[time_col]
+            .diff()
+            .reindex(df.index)
+        )
+    else:
+        df["dt_ms"] = np.nan
+
+    if len(dt_bins_ms) >= 2:
+        labels = []
+        for i in range(len(dt_bins_ms) - 1):
+            lo = dt_bins_ms[i]
+            hi = dt_bins_ms[i + 1]
+            labels.append(f"[{lo:.0f},{hi:.0f})")
+        df["dt_bin"] = pd.cut(df["dt_ms"], bins=dt_bins_ms, labels=labels, right=False, include_lowest=True)
+        # Keep explicit missing-bin labels instead of mixing string 'nan' and NaN values.
+        df["dt_bin"] = df["dt_bin"].astype(object)
+        df.loc[df["dt_bin"].isna(), "dt_bin"] = "missing"
+        df["dt_bin"] = df["dt_bin"].astype(str)
+    else:
+        df["dt_bin"] = "missing"
+
+    y_true = df[["label_X", "label_Y"]].to_numpy(dtype=float)
+    long_rows = []
+
+    for model_name, y_pred in preds_by_model.items():
+        yp = np.asarray(y_pred, dtype=float)
+        if yp.ndim != 2 or yp.shape[1] != 2 or yp.shape[0] != len(df):
+            continue
+        mask = np.isfinite(y_true).all(axis=1) & np.isfinite(yp).all(axis=1)
+        if int(mask.sum()) < min_points:
+            continue
+
+        err = np.linalg.norm(yp[mask] - y_true[mask], axis=1)
+        part = df.loc[mask, ["device", "motion", "session_id", "segment_id", "dt_bin"]].copy()
+        part["model"] = str(model_name)
+        part["err_m"] = err
+        long_rows.append(part)
+
+    if not long_rows:
+        empty = pd.DataFrame()
+        return {
+            "long": empty,
+            "by_device_motion": empty,
+            "by_session": empty,
+            "by_dt_bin": empty,
+        }
+
+    long_df = pd.concat(long_rows, ignore_index=True)
+
+    def _summarize(group_cols: List[str]) -> pd.DataFrame:
+        agg = (
+            long_df.groupby(group_cols, dropna=False)["err_m"]
+            .agg(
+                n="size",
+                mean_err_m="mean",
+                median_err_m="median",
+                p90_err_m=lambda s: float(np.quantile(np.asarray(s, dtype=float), 0.90)),
+                p95_err_m=lambda s: float(np.quantile(np.asarray(s, dtype=float), 0.95)),
+                rmse_2d_m=lambda s: float(np.sqrt(np.mean(np.asarray(s, dtype=float) ** 2))),
+            )
+            .reset_index()
+        )
+        return agg.sort_values(["model", "median_err_m"], kind="mergesort").reset_index(drop=True)
+
+    return {
+        "long": long_df,
+        "by_device_motion": _summarize(["model", "device", "motion"]),
+        "by_session": _summarize(["model", "session_id"]),
+        "by_dt_bin": _summarize(["model", "dt_bin"]),
+    }
+
+
+def estimate_ensemble_uncertainty(
+    preds_by_model: Dict[str, np.ndarray],
+    *,
+    y_true: np.ndarray | None = None,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """Estimate pointwise epistemic uncertainty from inter-model disagreement."""
+
+    valid = {}
+    n_ref = None
+    for name, arr in preds_by_model.items():
+        a = np.asarray(arr, dtype=float)
+        if a.ndim != 2 or a.shape[1] != 2:
+            continue
+        if n_ref is None:
+            n_ref = a.shape[0]
+        if a.shape[0] != n_ref:
+            continue
+        valid[str(name)] = a
+
+    if not valid:
+        return pd.DataFrame(), {"n_models": 0.0}
+
+    model_names = sorted(valid.keys())
+    stack = np.stack([valid[m] for m in model_names], axis=0)  # (M, N, 2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        with np.errstate(invalid="ignore"):
+            mean_pred = np.nanmean(stack, axis=0)
+            std_xy = np.nanstd(stack, axis=0)
+    valid_counts = np.sum(np.isfinite(stack).all(axis=2), axis=0)
+    uncertainty = np.linalg.norm(std_xy, axis=1)
+
+    out = pd.DataFrame(
+        {
+            "idx": np.arange(mean_pred.shape[0], dtype=int),
+            "pred_mean_x": mean_pred[:, 0],
+            "pred_mean_y": mean_pred[:, 1],
+            "uncertainty_m": uncertainty,
+            "n_models_available": valid_counts.astype(int),
+            "n_models_total": int(len(model_names)),
+        }
+    )
+
+    u_mask = np.isfinite(uncertainty)
+    if int(u_mask.sum()) > 0:
+        u_vals = uncertainty[u_mask]
+        u_med = float(np.median(u_vals))
+        u_p90 = float(np.quantile(u_vals, 0.90))
+        u_p95 = float(np.quantile(u_vals, 0.95))
+    else:
+        u_med = np.nan
+        u_p90 = np.nan
+        u_p95 = np.nan
+
+    summary: Dict[str, float] = {
+        "n_models": float(len(model_names)),
+        "uncertainty_median_m": u_med,
+        "uncertainty_p90_m": u_p90,
+        "uncertainty_p95_m": u_p95,
+    }
+
+    if y_true is not None:
+        yt = np.asarray(y_true, dtype=float)
+        if yt.ndim == 2 and yt.shape[1] == 2 and yt.shape[0] == mean_pred.shape[0]:
+            err = np.linalg.norm(mean_pred - yt, axis=1)
+            out["error_mean_pred_m"] = err
+            mask = np.isfinite(uncertainty) & np.isfinite(err)
+            if int(mask.sum()) > 5 and np.std(uncertainty[mask]) > 0:
+                summary["corr_uncertainty_error"] = float(np.corrcoef(uncertainty[mask], err[mask])[0, 1])
+            else:
+                summary["corr_uncertainty_error"] = np.nan
+
+    return out, summary
+
+
+def run_seq_group_split_cv(
+    base_df: pd.DataFrame,
+    *,
+    cfg: Config,
+    n_splits: int = 5,
+    split_seeds: List[int] | None = None,
+    run_id_prefix: str | None = None,
+    test_size: float | None = None,
+    force_recompute: bool | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run repeated group splits (by session) for robust sequential-model estimates."""
+
+    if n_splits <= 0:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df = add_session_id(base_df)
+    tsize = float(test_size if test_size is not None else _get_cfg(cfg, "test_size", 0.3))
+    fr = bool(force_recompute) if force_recompute is not None else bool(getattr(cfg, "force_recompute", False))
+    rid = run_id_prefix or f"{getattr(cfg, 'run_id', 'run')}__cv"
+
+    if split_seeds is None:
+        base_seed = int(_get_cfg(cfg, "random_seed", 42))
+        split_seeds = [base_seed + 17 * i for i in range(n_splits)]
+    else:
+        split_seeds = [int(s) for s in split_seeds[:n_splits]]
+    if not split_seeds:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    fold_rows = []
+    fold_meta_rows = []
+
+    for fold_idx, seed in enumerate(split_seeds):
+        set_global_seed(int(seed))
+        df_train, df_test = group_split(df, group_col="session_id", test_size=tsize, seed=seed)
+
+        cfg_i = deepcopy(cfg)
+        cfg_i.random_seed = int(seed)
+        cfg_i.run_id = f"{rid}__fold{fold_idx:02d}_seed{seed}"
+        cfg_i.force_recompute = fr
+
+        try:
+            seq_bundle = prepare_seq_data(
+                df_train,
+                df_test,
+                cfg=cfg_i,
+                run_id=cfg_i.run_id,
+                force_recompute=fr,
+            )
+            metrics_i, _, _ = eval_seq_models(seq_bundle, cfg=cfg_i)
+            metrics_i = metrics_i.drop(columns=["errors_radial_m"], errors="ignore").copy()
+            metrics_i["fold"] = int(fold_idx)
+            metrics_i["seed"] = int(seed)
+            metrics_i["run_id"] = str(cfg_i.run_id)
+            metrics_i["test_rows"] = int(len(df_test))
+            metrics_i["test_sessions"] = int(df_test["session_id"].nunique())
+            metrics_i["test_coverage"] = float(seq_bundle["seq_coverage"])
+            metrics_i["test_windows"] = int(seq_bundle["n_test_windows"])
+            fold_rows.append(metrics_i)
+
+            fold_meta_rows.append(
+                {
+                    "fold": int(fold_idx),
+                    "seed": int(seed),
+                    "run_id": str(cfg_i.run_id),
+                    "status": "ok",
+                    "test_rows": int(len(df_test)),
+                    "test_sessions": int(df_test["session_id"].nunique()),
+                    "test_coverage": float(seq_bundle["seq_coverage"]),
+                    "test_windows": int(seq_bundle["n_test_windows"]),
+                    "window_size_effective": int(seq_bundle["window_size_effective"]),
+                }
+            )
+        except Exception as e:  # pragma: no cover - defensive capture for long CV runs
+            fold_meta_rows.append(
+                {
+                    "fold": int(fold_idx),
+                    "seed": int(seed),
+                    "run_id": str(cfg_i.run_id),
+                    "status": "fail",
+                    "error": str(e),
+                }
+            )
+
+    fold_df = pd.concat(fold_rows, ignore_index=True) if fold_rows else pd.DataFrame()
+    fold_meta_df = pd.DataFrame(fold_meta_rows)
+
+    if fold_df.empty:
+        summary_df = pd.DataFrame()
+    else:
+        summary_df = (
+            fold_df.groupby("model", dropna=False)
+            .agg(
+                n_folds=("fold", "nunique"),
+                median_err_mean=("median_err_m", "mean"),
+                median_err_std=("median_err_m", "std"),
+                median_err_q025=("median_err_m", lambda s: float(np.quantile(np.asarray(s, dtype=float), 0.025))),
+                median_err_q975=("median_err_m", lambda s: float(np.quantile(np.asarray(s, dtype=float), 0.975))),
+                p90_err_mean=("p90_err_m", "mean"),
+                p90_err_std=("p90_err_m", "std"),
+                rmse_mean=("rmse_2d_m", "mean"),
+                rmse_std=("rmse_2d_m", "std"),
+                coverage_mean=("test_coverage", "mean"),
+                windows_mean=("test_windows", "mean"),
+            )
+            .reset_index()
+            .sort_values("median_err_mean", kind="mergesort")
+            .reset_index(drop=True)
+        )
+
+    if rid:
+        fold_csv = artifact_path("metrics", "results_seq_cv_folds", rid, "csv")
+        summary_csv = artifact_path("metrics", "results_seq_cv_summary", rid, "csv")
+        meta_csv = artifact_path("metrics", "results_seq_cv_meta", rid, "csv")
+        if not fold_df.empty:
+            fold_df.to_csv(fold_csv, index=False)
+        if not summary_df.empty:
+            summary_df.to_csv(summary_csv, index=False)
+        if not fold_meta_df.empty:
+            fold_meta_df.to_csv(meta_csv, index=False)
+
+    return fold_df, summary_df, fold_meta_df
+
+
+def eval_fair(name, y_true, y_pred, thresholds=(0.25, 0.5, 1.0, 2.0)):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    n = min(len(y_true), len(y_pred))
+    yt = y_true[:n]
+    yp = y_pred[:n]
+    mask = np.isfinite(yt).all(axis=1) & np.isfinite(yp).all(axis=1)
+    if mask.sum() < 5:
+        return None
+    r = evaluate_regression(yt[mask], yp[mask], name, thresholds=thresholds)
+    r["n_eval"] = int(mask.sum())
+    r["coverage_eval"] = float(mask.mean())
+    r.update(classify_model_protocol(name))
+    return r

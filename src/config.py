@@ -70,28 +70,27 @@ class Config:
     baseline_max_speed_mps: float = 2.5
 
     rolling_window_size: int = 10
-    window_size: int = 8
+    window_size: int = 12
     seq_max_dt_ms: float | None = None
-    epochs: int = 100
-    patience: int = 20
+    epochs: int = 80
+    patience: int = 18
     batch_size: int = 128
     lr: float = 5e-4
     seq_use_pca: bool = False
     seq_pca_n_components: int = 20
     seq_pca_topk_corr: int = 20
     top_k: int = 20
-    seq_use_topk_corr: bool = False
+    seq_use_topk_corr: bool = True
     seq_topk_corr_k: int = 20
     seq_target_mode: str = "delta"
     run_seq_pca_experiment: bool = False
-    seq_use_anchor_points: bool = False
     seq_include_time_feature: bool = False
     seq_ignore_time_checks: bool = True
     seq_densify_step_ms: int | None = 160
     seq_densify_max_factor: float = 4.0
-    seq_min_test_windows: int = 80
-    seq_min_coverage: float = 0.25
-    seq_min_window_size: int = 4
+    seq_min_test_windows: int = 120
+    seq_min_coverage: float = 0.30
+    seq_min_window_size: int = 6
 
     test_size: float = 0.3
     val_size: float = 0.2
@@ -132,17 +131,21 @@ class Config:
 
     lstm_params: Dict[str, Any] = field(
         default_factory=lambda: {
-            "hidden_dim": 64,
-            "num_layers": 1,
-            "dropout_lstm": 0.1,
-            "dropout_fc": 0.05,
+            "hidden_dim": 96,
+            "num_layers": 2,
+            "dropout_lstm": 0.10,
+            "dropout_fc": 0.10,
         }
     )
     gru_params: Dict[str, Any] = field(
-        default_factory=lambda: {"hidden_dim": 32, "num_layers": 1, "dropout_gru": 0.25}
+        default_factory=lambda: {
+            "hidden_dim": 96,
+            "num_layers": 2,
+            "dropout_gru": 0.15,
+        }
     )
-    gru_lr: float = 2e-4
-    gru_patience: int = 12
+    gru_lr: float = 4e-4
+    gru_patience: int = 16
 
 
 def set_global_seed(seed: int) -> None:

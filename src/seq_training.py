@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,12 +36,25 @@ def build_sequences(
     max_dt_ms: float | None = None,
     max_window_ms: float | None = None,
     enforce_time_checks: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    return_stats: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, List[int]] | Tuple[np.ndarray, np.ndarray, List[int], Dict[str, float]]:
     """Create (N, T, D) sequences and (N, 2) targets from dataframe."""
 
     X_seqs: List[np.ndarray] = []
     y_seqs: List[np.ndarray] = []
     idx_seq: List[int] = []
+    stats: Dict[str, float] = {
+        "time_checks_enabled": float(bool(enforce_time_checks)),
+        "n_groups": 0.0,
+        "n_rows": float(len(df)),
+        "n_candidate_windows": 0.0,
+        "n_kept_windows": 0.0,
+        "rejected_empty_dt": 0.0,
+        "rejected_non_finite_dt": 0.0,
+        "rejected_non_positive_dt": 0.0,
+        "rejected_max_dt": 0.0,
+        "rejected_max_window": 0.0,
+    }
 
     if session_col is not None and segment_col is not None and segment_col in df.columns:
         groups = df.groupby([session_col, segment_col])
@@ -51,11 +64,13 @@ def build_sequences(
         groups = [(None, df)]
 
     for _, g in groups:
+        stats["n_groups"] += 1.0
         if time_col in g.columns:
             g = g.sort_values(time_col, kind="mergesort")
         values = g[feature_cols].values
         y_values = g[list(target_cols)].values if set(target_cols).issubset(g.columns) else None
         t_values = g[time_col].to_numpy(dtype=float) if time_col in g.columns else None
+        stats["n_candidate_windows"] += float(max(len(g) - window_size + 1, 0))
 
         for i in range(window_size - 1, len(g)):
             start = i - window_size + 1
@@ -64,14 +79,19 @@ def build_sequences(
                 t_win = t_values[start:end]
                 dt = np.diff(t_win)
                 if dt.size == 0:
+                    stats["rejected_empty_dt"] += 1.0
                     continue
                 if not np.all(np.isfinite(dt)):
+                    stats["rejected_non_finite_dt"] += 1.0
                     continue
                 if np.any(dt <= 0):
+                    stats["rejected_non_positive_dt"] += 1.0
                     continue
                 if max_dt_ms is not None and np.max(dt) >= max_dt_ms:
+                    stats["rejected_max_dt"] += 1.0
                     continue
                 if max_window_ms is not None and (t_win[-1] - t_win[0]) >= max_window_ms:
+                    stats["rejected_max_window"] += 1.0
                     continue
             X_seqs.append(values[start:end])
             if y_values is not None:
@@ -86,6 +106,16 @@ def build_sequences(
 
     X_arr = np.asarray(X_seqs)
     y_arr = np.asarray(y_seqs) if y_seqs else np.empty((0, 2))
+    stats["n_kept_windows"] = float(len(idx_seq))
+    stats["n_rejected_windows"] = float(stats["n_candidate_windows"] - stats["n_kept_windows"])
+    stats["acceptance_ratio"] = (
+        float(stats["n_kept_windows"] / max(1.0, stats["n_candidate_windows"]))
+        if stats["n_candidate_windows"] > 0
+        else 0.0
+    )
+
+    if return_stats:
+        return X_arr, y_arr, idx_seq, stats
     return X_arr, y_arr, idx_seq
 
 

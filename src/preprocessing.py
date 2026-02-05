@@ -102,10 +102,6 @@ def align_labels_asof(
     out = out.sort_values([session_col, time_col], kind="mergesort").reset_index(drop=True)
     out = _aggregate_by_time(out, session_col=session_col, time_col=time_col)
 
-    # preserve anchor labels for diagnostics/plotting
-    out["anchor_X"] = out["X"]
-    out["anchor_Y"] = out["Y"]
-
     labels = out[[session_col, time_col, "X", "Y"]].dropna(subset=["X", "Y"]).copy()
     if labels.empty:
         return out
@@ -194,8 +190,6 @@ def trim_columns_by_nan(df: pd.DataFrame, max_nan_ratio: float) -> pd.DataFrame:
         "dt_ms",
         "label_X",
         "label_Y",
-        "anchor_X",
-        "anchor_Y",
         "segment_id",
     }
     cols_to_keep = [c for c in df.columns if (c in protected_cols) or (null_ratio.get(c, 1.0) <= max_nan_ratio)]
