@@ -1,87 +1,132 @@
-# Indoor Localization using WiFi and Inertial Sensors
+# Indoor Localization with Temporal Deep Learning
 
-> Master 2 ETAI Project - Polytech
-> Indoor Localization / Machine Learning / Embedded Systems
+Master 2 ETAI project, Polytech Nantes  
+Topic: indoor positioning from WiFi + IMU time series
 
----
+## Project framing
 
-## Description
+This repository studies 2D indoor localization under strict constraints:
 
-This repository contains an **indoor localization** project based on **WiFi** signals and **inertial sensors**.  
-The goal is to study the feasibility and limits of **data-driven** approaches for estimating a 2D position in indoor environments.
+- only the provided dataset is allowed
+- the approach must be temporal
+- deep learning must be used
+- LSTM and GRU are mandatory
+- the sequence heads follow a diamond topology
 
-The project compares:
+Diamond topology used in this project:
 
-- **Pointwise (static)** models,
-- **Sequential** models (LSTM / GRU),
-- A **simple hybridation** between the two,
+`n_features -> wider -> n_features -> narrower -> small -> outputs`
 
-and analyzes their **cross-session and cross-device** robustness (ESP32 vs smartphone).
+## Problem statement
 
-This work is part of an academic Master 2 project (ETAI) and focuses on a **rigorous methodological analysis** rather than state-of-the-art performance.
+Given a stream of sensor observations at time `t`:
 
----
+- WiFi RSSI values
+- accelerometer, gyroscope, magnetometer
+- contextual metadata
 
-## Project Goals
+predict the position target `(X_t, Y_t)` while learning motion dynamics, not only pointwise mapping.
 
-- Estimate 2D position (X, Y) from WiFi and inertial sensor data.
-- Compare static and sequential approaches.
-- Study cross-device generalization.
-- Identify structural limits of purely data-driven indoor localization.
+## What this work evaluates
 
----
+| Question | Why it matters |
+|---|---|
+| Can temporal DL models recover trajectory structure from this signal? | Core feasibility |
+| How stable are predictions over time? | Motion consistency |
+| What changes in cross-device transfer (ESP32 vs Samsung)? | Domain robustness |
+| Are errors dominated by model design or data structure? | Practical limits |
 
-## Data
+## Data and assumptions
 
-The dataset includes multiple indoor trajectories recorded with:
+### Inputs
 
-- WiFi RSSI measurements,
-- Inertial sensors (accelerometer, magnetometer, gyroscope),
-- Absolute timestamps,
-- Reference positions (X, Y labels).
+| Group | Columns (examples) |
+|---|---|
+| Time | `t_ms` |
+| IMU | `Accel*`, `Gyro*`, `Magneto*` |
+| WiFi | AP RSSI columns |
+| Metadata | `device`, `motion`, `session_id` |
+| Targets | `label_X`, `label_Y` and anchors when available |
 
-Each trajectory is associated with:
+### Working assumptions
 
-- a device (`ESP32` or `Samsung`),
-- a motion context (`motion`).
+- timestamps can be aligned to produce coherent training windows
+- time continuity is meaningful inside segments
+- some irregularity is expected (gaps, bursts, sparse anchors)
+- evaluation must report coverage, not only error
 
----
+## Method overview
 
-## Methodology
+1. Build a clean temporal base dataframe
+   - timestamp normalization
+   - label/feature alignment (`merge_asof`)
+   - session segmentation
+2. Build features
+   - raw IMU + derivatives + rolling stats
+   - WiFi top-k selection and aggregation
+3. Build temporal windows
+   - adaptive constraints and fallback strategy to preserve enough windows
+   - optional controlled densification for coverage
+4. Train deep sequence models
+   - LSTM + diamond head
+   - GRU + diamond head
+5. Apply post-processing
+   - kinematic guardrails
+   - optional Kalman smoothing
+6. Run intra-device and cross-device evaluation
 
-### Feature Engineering
+## Models used in the report
 
-- Selection and encoding of WiFi access points (top-k, presence, RSSI).
-- Raw inertial signals with simple derivatives and rolling statistics.
-- Encoding of contextual variables (`motion`).
-- Controlled exclusion of `device` during cross-device tests.
+| Type | Models |
+|---|---|
+| Temporal DL (main) | `LSTM_FE`, `GRU_FE` |
+| Temporal DL + filtering | `LSTM_FE_KF`, `GRU_FE_KF` |
+| Trajectory references | last-position oracle, constant-velocity oracle, constant-velocity rollout |
 
-### Models
+Note: non-DL tabular models may exist in code for diagnostics, but the graded core is the temporal DL pipeline.
 
-- **Pointwise**: Random Forest, XGBoost, kNN
-- **Sequential**: LSTM, GRU
-- **Naive Hybrid**: linear combination of XGB / LSTM
+## Comparisons and statistics
 
-### Evaluation
+### Comparisons
 
-- Cross-device tests.
-- Trajectory-based splits (no temporal leakage).
-- Metrics: median, p90/p95, CDF of error.
-- Visualization of trajectories and errors.
+- LSTM vs GRU
+- raw vs Kalman-smoothed outputs
+- intra-device vs cross-device
+- sequence models vs trajectory baselines
 
----
+### Metrics
 
-## Main Results
+| Category | Metrics |
+|---|---|
+| Spatial error | RMSE/MAE 2D |
+| Distribution | median, p90, p95, p99 radial error |
+| Axis behavior | `mae_x`, `mae_y`, `bias_x`, `bias_y` |
+| Temporal reliability | cumulative error, valid prediction coverage |
 
-- Pointwise models show better spatial stability by RMSE.
-- Sequential models improve temporal continuity but drift spatially (error accumulation).
-- Naive hybridation shows potential but remains limited (too simple).
-- Cross-device generalization is strongly affected by domain shift (offsets / bias).
-- Without a map or explicit spatial constraints, performance hits a ceiling.
+### Plots generated
 
----
+- trajectory overlays (`True` vs `Pred`)
+- CDF error curves
+- cumulative error curves
+- per-axis error diagnostics
+- cross-device trajectory views
 
-## Installation (Linux venv)
+## Reproducibility
+
+Main notebook:
+
+- `Report_Indoor_Localisation.ipynb`
+
+Output folders:
+
+- `outputs/metrics`
+- `outputs/figures`
+- `outputs/fe`
+- `outputs/models`
+
+## Setup
+
+### Linux
 
 ```bash
 python -m venv .venv
@@ -89,39 +134,25 @@ source .venv/bin/activate
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 \
     --index-url https://pypi.org/simple \
     -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-```
-
-### Utilization
-
-```bash
-source .venv/bin/activate
 pip install jupyter
 jupyter notebook
 ```
 
-It will open a browser page where you can select Report_Indoor_Localisation.ipynb and run it in the notebook or in the lab.
-Results will be stored in `outputs/` and figures generated are previewed in the notebook directly.
+### Windows
 
-## installation and utilization (Windows)
-
-```ps1
-python -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 \
-    --index-url https://pypi.org/simple \
+```powershell
+python -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 `
+    --index-url https://pypi.org/simple `
     -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-    python -m pip install jupyter
+python -m pip install jupyter
 jupyter notebook
 ```
 
----
-
 ## Author
 
-Master's student - Embedded Systems & Artificial Intelligence  
-Flavien Jalabert
-Polytech Nantes
-
----
+Flavien Jalabert  
+Master ETAI, Polytech Nantes
 
 ## License
 
-This project is provided for academic and educational purposes.
+Academic and educational use.

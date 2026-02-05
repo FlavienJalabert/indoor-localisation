@@ -37,6 +37,10 @@ def out_figures_dir() -> Path:
     return outputs_dir() / "figures"
 
 
+def out_reports_dir() -> Path:
+    return outputs_dir() / "reports"
+
+
 def ensure_dirs() -> None:
     for p in [
         outputs_dir(),
@@ -46,5 +50,6 @@ def ensure_dirs() -> None:
         out_models_dir(),
         out_metrics_dir(),
         out_figures_dir(),
+        out_reports_dir(),
     ]:
         p.mkdir(parents=True, exist_ok=True)

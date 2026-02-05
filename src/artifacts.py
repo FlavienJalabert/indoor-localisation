@@ -24,6 +24,7 @@ def artifact_path(kind: str, name: str, run_id: str, ext: str) -> Path:
         "models": paths.out_models_dir(),
         "metrics": paths.out_metrics_dir(),
         "figures": paths.out_figures_dir(),
+        "reports": paths.out_reports_dir(),
     }.get(kind)
     if base is None:
         raise ValueError(f"Unknown artifact kind: {kind}")
@@ -36,7 +37,11 @@ def save_df(df: pd.DataFrame, path: Path) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix == ".csv":
-        df.to_csv(path, index=False)
+        out = df
+        if "errors_radial_m" in out.columns:
+            out = out.copy()
+            out["errors_radial_m"] = None
+        out.to_csv(path, index=False)
     else:
         raise ValueError("Unsupported DataFrame format. Use .csv")
 
@@ -86,6 +91,10 @@ def _jsonify(obj):
         return {str(k): _jsonify(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
         return [_jsonify(v) for v in obj]
+    if isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient="records")
+    if isinstance(obj, pd.Series):
+        return obj.to_dict()
     if isinstance(obj, Path):
         return str(obj)
     if isinstance(obj, np.ndarray):

@@ -11,9 +11,14 @@ from sklearn.model_selection import GroupShuffleSplit
 def add_session_id(
     df: pd.DataFrame, cols: Tuple[str, str] = ("device", "motion"), name: str = "session_id"
 ) -> pd.DataFrame:
-    """Add a session identifier by concatenating device/motion columns."""
+    """Add a session identifier. Prefer session_file if present."""
 
     out = df.copy()
+    if name in out.columns:
+        return out
+    if "session_file" in out.columns:
+        out[name] = out["session_file"].astype(str)
+        return out
     out[name] = out[cols[0]].astype(str) + "__" + out[cols[1]].astype(str)
     return out
 
@@ -35,6 +40,9 @@ def group_split_train_val(
     df_train: pd.DataFrame, group_col: str, val_size: float, seed: int
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Group-aware train/val split from a training dataframe."""
+
+    if df_train.empty or df_train[group_col].nunique() < 2:
+        return (df_train.copy(), df_train.iloc[:0].copy())
 
     gss = GroupShuffleSplit(n_splits=1, test_size=val_size, random_state=seed)
     tr_idx, val_idx = next(gss.split(df_train, groups=df_train[group_col]))

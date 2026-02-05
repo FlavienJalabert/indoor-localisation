@@ -51,6 +51,7 @@ from seq_training import (
     seq_preds_to_pointwise,
 )
 from seq_models import LSTMRegressorDiamond, GRURegressorDiamond
+from filters import kalman_filter_2d
 
 
 # -------------------------
@@ -75,18 +76,22 @@ def _dict_npz_to_preds(d: dict) -> Dict[str, np.ndarray]:
 def _reconstruct_positions_from_deltas(
     df_test_base: pd.DataFrame, idx_seq: list[int], y_pred_delta: np.ndarray
 ) -> np.ndarray:
-    """Reconstruct absolute positions from delta predictions, anchored at the first true point per session."""
+    """Reconstruct absolute positions from delta predictions, anchored at the first true point per segment."""
 
     idx_seq = np.asarray(idx_seq, dtype=int)
     if "session_id" not in df_test_base.columns:
         df_test_base = add_session_id(df_test_base)
 
-    seq_meta = df_test_base.loc[idx_seq, ["session_id", "label_X", "label_Y"]].copy()
+    group_cols = ["session_id"]
+    if "segment_id" in df_test_base.columns:
+        group_cols.append("segment_id")
+
+    seq_meta = df_test_base.loc[idx_seq, group_cols + ["label_X", "label_Y"]].copy()
     seq_meta["seq_pos"] = np.arange(len(idx_seq))
 
     y_pred_pos = np.zeros((len(idx_seq), 2), dtype=float)
 
-    for sid, g in seq_meta.groupby("session_id"):
+    for _, g in seq_meta.groupby(group_cols):
         # preserve sequence order as built in build_sequences (seq_pos), not original index
         g_sorted = g.sort_values("seq_pos")
         seq_idx = g_sorted["seq_pos"].to_numpy()
@@ -99,6 +104,242 @@ def _reconstruct_positions_from_deltas(
         y_pred_pos[seq_idx] = pos
 
     return y_pred_pos
+
+
+def baseline_last_position(df: pd.DataFrame, *, time_col: str = "t_ms") -> np.ndarray:
+    """Predict previous position within each session (persistence baseline)."""
+
+    df_work = df.copy().reset_index(drop=True)
+    if "session_id" not in df_work.columns:
+        df_work = add_session_id(df_work)
+    df_work["__row_id"] = np.arange(len(df_work))
+
+    group_cols = ["session_id"]
+    if "segment_id" in df_work.columns:
+        group_cols.append("segment_id")
+
+    out = np.zeros((len(df_work), 2), dtype=float)
+    for _, g in df_work.groupby(group_cols, sort=False):
+        if time_col in g.columns:
+            g_sorted = g.sort_values(time_col, kind="mergesort")
+        else:
+            g_sorted = g.sort_values("__row_id", kind="mergesort")
+        y = g_sorted[["label_X", "label_Y"]].to_numpy(dtype=float)
+        if len(y) == 0:
+            continue
+        pred = np.vstack([y[:1], y[:-1]])
+        out[g_sorted["__row_id"].to_numpy(dtype=int)] = pred
+    return out
+
+
+def baseline_constant_velocity(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "t_ms",
+    max_speed_mps: float | None = 2.5,
+    max_dt_ms: float | None = 1000.0,
+) -> np.ndarray:
+    """Predict next position using constant velocity from last two points."""
+
+    df_work = df.copy().reset_index(drop=True)
+    if "session_id" not in df_work.columns:
+        df_work = add_session_id(df_work)
+    df_work["__row_id"] = np.arange(len(df_work))
+
+    group_cols = ["session_id"]
+    if "segment_id" in df_work.columns:
+        group_cols.append("segment_id")
+
+    out = np.zeros((len(df_work), 2), dtype=float)
+    for _, g in df_work.groupby(group_cols, sort=False):
+        if time_col in g.columns:
+            g_sorted = g.sort_values(time_col, kind="mergesort")
+            t = g_sorted[time_col].to_numpy(dtype=float)
+        else:
+            g_sorted = g.sort_values("__row_id", kind="mergesort")
+            t = np.arange(len(g_sorted), dtype=float)
+        y = g_sorted[["label_X", "label_Y"]].to_numpy(dtype=float)
+        if len(y) == 0:
+            continue
+        pred = np.zeros_like(y)
+        pred[0] = y[0]
+        if len(y) > 1:
+            pred[1] = y[0]
+        for i in range(2, len(y)):
+            dt_prev = (t[i - 1] - t[i - 2]) / 1000.0
+            dt_curr = (t[i] - t[i - 1]) / 1000.0
+            if (
+                not np.isfinite(dt_prev)
+                or not np.isfinite(dt_curr)
+                or dt_prev <= 0
+                or dt_curr <= 0
+                or (max_dt_ms is not None and ((dt_prev * 1000.0 > max_dt_ms) or (dt_curr * 1000.0 > max_dt_ms)))
+            ):
+                pred[i] = y[i - 1]
+                continue
+            v = (y[i - 1] - y[i - 2]) / dt_prev
+            if max_speed_mps is not None and max_speed_mps > 0:
+                speed = float(np.linalg.norm(v))
+                if np.isfinite(speed) and speed > max_speed_mps:
+                    v = v * (max_speed_mps / max(speed, 1e-12))
+            pred[i] = y[i - 1] + v * dt_curr
+        out[g_sorted["__row_id"].to_numpy(dtype=int)] = pred
+    return out
+
+
+def baseline_constant_velocity_rollout(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "t_ms",
+    max_speed_mps: float | None = 2.5,
+    max_dt_ms: float | None = 1000.0,
+) -> np.ndarray:
+    """Autoregressive constant-velocity baseline (uses previous predictions, not true labels)."""
+
+    df_work = df.copy().reset_index(drop=True)
+    if "session_id" not in df_work.columns:
+        df_work = add_session_id(df_work)
+    df_work["__row_id"] = np.arange(len(df_work))
+
+    group_cols = ["session_id"]
+    if "segment_id" in df_work.columns:
+        group_cols.append("segment_id")
+
+    out = np.zeros((len(df_work), 2), dtype=float)
+    for _, g in df_work.groupby(group_cols, sort=False):
+        if time_col in g.columns:
+            g_sorted = g.sort_values(time_col, kind="mergesort")
+            t = g_sorted[time_col].to_numpy(dtype=float)
+        else:
+            g_sorted = g.sort_values("__row_id", kind="mergesort")
+            t = np.arange(len(g_sorted), dtype=float)
+        y = g_sorted[["label_X", "label_Y"]].to_numpy(dtype=float)
+        if len(y) == 0:
+            continue
+        pred = np.zeros_like(y)
+        pred[0] = y[0]
+        if len(y) > 1:
+            pred[1] = y[1]
+        for i in range(2, len(y)):
+            dt_prev = (t[i - 1] - t[i - 2]) / 1000.0
+            dt_curr = (t[i] - t[i - 1]) / 1000.0
+            if (
+                not np.isfinite(dt_prev)
+                or not np.isfinite(dt_curr)
+                or dt_prev <= 0
+                or dt_curr <= 0
+                or (max_dt_ms is not None and ((dt_prev * 1000.0 > max_dt_ms) or (dt_curr * 1000.0 > max_dt_ms)))
+            ):
+                pred[i] = pred[i - 1]
+                continue
+            v = (pred[i - 1] - pred[i - 2]) / dt_prev
+            if max_speed_mps is not None and max_speed_mps > 0:
+                speed = float(np.linalg.norm(v))
+                if np.isfinite(speed) and speed > max_speed_mps:
+                    v = v * (max_speed_mps / max(speed, 1e-12))
+            pred[i] = pred[i - 1] + v * dt_curr
+        out[g_sorted["__row_id"].to_numpy(dtype=int)] = pred
+    return out
+
+
+def _apply_kalman_by_group(
+    y_pred: np.ndarray,
+    df_ref: pd.DataFrame,
+    *,
+    time_col: str = "t_ms",
+    process_var: float = 1e-3,
+    meas_var: float = 1e-1,
+) -> np.ndarray:
+    """Apply Kalman smoothing independently on each session/segment group."""
+
+    y_pred = np.asarray(y_pred, dtype=float)
+    if y_pred.ndim != 2 or y_pred.shape[1] != 2:
+        raise ValueError("y_pred must be (N,2)")
+    if len(df_ref) != y_pred.shape[0]:
+        raise ValueError("df_ref and y_pred must have the same length")
+
+    df = df_ref.copy().reset_index(drop=True)
+    if "session_id" not in df.columns:
+        df = add_session_id(df)
+    group_cols = ["session_id"]
+    if "segment_id" in df.columns:
+        group_cols.append("segment_id")
+    df["__row_id"] = np.arange(len(df))
+
+    out = np.zeros_like(y_pred, dtype=float)
+    for _, g in df.groupby(group_cols, sort=False):
+        if time_col in g.columns:
+            g_sorted = g.sort_values(time_col, kind="mergesort")
+            t_ms = g_sorted[time_col].to_numpy(dtype=float)
+        else:
+            g_sorted = g.sort_values("__row_id", kind="mergesort")
+            t_ms = None
+        idx = g_sorted["__row_id"].to_numpy(dtype=int)
+        filt = kalman_filter_2d(
+            y_pred[idx],
+            t_ms=t_ms,
+            process_var=process_var,
+            meas_var=meas_var,
+        )
+        out[idx] = filt
+    return out
+
+
+def _stabilize_predictions_by_group(
+    y_pred: np.ndarray,
+    df_ref: pd.DataFrame,
+    *,
+    time_col: str = "t_ms",
+    max_speed_mps: float | None = 2.5,
+    max_dt_ms: float | None = 1000.0,
+) -> np.ndarray:
+    """Apply simple kinematic guardrails per session/segment on predicted trajectories."""
+
+    y_pred = np.asarray(y_pred, dtype=float)
+    if y_pred.ndim != 2 or y_pred.shape[1] != 2:
+        raise ValueError("y_pred must be (N,2)")
+    if len(df_ref) != y_pred.shape[0]:
+        raise ValueError("df_ref and y_pred must have the same length")
+
+    df = df_ref.copy().reset_index(drop=True)
+    if "session_id" not in df.columns:
+        df = add_session_id(df)
+    df["__row_id"] = np.arange(len(df))
+
+    group_cols = ["session_id"]
+    if "segment_id" in df.columns:
+        group_cols.append("segment_id")
+
+    out = np.asarray(y_pred, dtype=float).copy()
+    for _, g in df.groupby(group_cols, sort=False):
+        if time_col in g.columns:
+            g_sorted = g.sort_values(time_col, kind="mergesort")
+            t = g_sorted[time_col].to_numpy(dtype=float)
+        else:
+            g_sorted = g.sort_values("__row_id", kind="mergesort")
+            t = np.arange(len(g_sorted), dtype=float)
+        idx = g_sorted["__row_id"].to_numpy(dtype=int)
+        if idx.size <= 1:
+            continue
+
+        yp = out[idx].copy()
+        for i in range(1, len(idx)):
+            dt_s = (t[i] - t[i - 1]) / 1000.0
+            if (not np.isfinite(dt_s)) or dt_s <= 0 or (max_dt_ms is not None and dt_s * 1000.0 > max_dt_ms):
+                yp[i] = yp[i - 1]
+                continue
+            step = yp[i] - yp[i - 1]
+            step_norm = float(np.linalg.norm(step))
+            if not np.isfinite(step_norm):
+                yp[i] = yp[i - 1]
+                continue
+            if max_speed_mps is not None and max_speed_mps > 0:
+                max_step = max_speed_mps * dt_s
+                if step_norm > max_step:
+                    yp[i] = yp[i - 1] + step * (max_step / max(step_norm, 1e-12))
+
+        out[idx] = yp
+    return out
 
 
 # -------------------------
@@ -278,6 +519,7 @@ def eval_tabular_models(bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
     y_train = bundle["y_train"]
     y_test = bundle["y_test"]
     preproc = bundle["preprocessor"]
+    df_test_fe = bundle.get("df_test_fe")
 
     # Optional caching
     if run_id is not None:
@@ -293,6 +535,15 @@ def eval_tabular_models(bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
         p_results_pkl = p_results_csv = p_preds = None
 
     thresholds = tuple(_get_cfg(cfg, "thresholds", (0.25, 0.5, 1.0, 2.0)))
+    use_kalman = bool(_get_cfg(cfg, "use_kalman_postproc", True))
+    use_guardrails = bool(_get_cfg(cfg, "use_pred_guardrails", True))
+    time_col = str(_get_cfg(cfg, "time_col", "t_ms"))
+    max_speed_mps = _get_cfg(cfg, "baseline_max_speed_mps", 2.5)
+    max_speed_mps = float(max_speed_mps) if max_speed_mps is not None else None
+    max_dt_ms = _get_cfg(cfg, "gap_thr_ms", 1000.0)
+    max_dt_ms = float(max_dt_ms) if max_dt_ms is not None else None
+    kalman_process_var = float(_get_cfg(cfg, "kalman_process_var", 1e-3))
+    kalman_meas_var = float(_get_cfg(cfg, "kalman_meas_var", 1e-1))
 
     preds_by_model: Dict[str, np.ndarray] = {}
     rows = []
@@ -300,20 +551,50 @@ def eval_tabular_models(bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
     # kNN
     knn = train_knn(X_train, y_train, preproc, knn_params=dict(_get_cfg(cfg, "knn_params", {})))
     y_pred = knn.predict(X_test)
+    if use_guardrails and df_test_fe is not None:
+        y_pred = _stabilize_predictions_by_group(
+            y_pred, df_test_fe, time_col=time_col, max_speed_mps=max_speed_mps, max_dt_ms=max_dt_ms
+        )
     preds_by_model["kNN_FE"] = np.asarray(y_pred, dtype=float)
     rows.append(evaluate_regression(y_test, y_pred, "kNN_FE", thresholds=thresholds))
+    if use_kalman and df_test_fe is not None:
+        y_pred_kf = _apply_kalman_by_group(
+            y_pred, df_test_fe, time_col=time_col, process_var=kalman_process_var, meas_var=kalman_meas_var
+        )
+        preds_by_model["kNN_FE_KF"] = np.asarray(y_pred_kf, dtype=float)
+        rows.append(evaluate_regression(y_test, y_pred_kf, "kNN_FE_KF", thresholds=thresholds))
 
     # RF
     rf = train_rf(X_train, y_train, preproc, rf_params=dict(_get_cfg(cfg, "rf_params", {})))
     y_pred = rf.predict(X_test)
+    if use_guardrails and df_test_fe is not None:
+        y_pred = _stabilize_predictions_by_group(
+            y_pred, df_test_fe, time_col=time_col, max_speed_mps=max_speed_mps, max_dt_ms=max_dt_ms
+        )
     preds_by_model["RandomForest_FE"] = np.asarray(y_pred, dtype=float)
     rows.append(evaluate_regression(y_test, y_pred, "RandomForest_FE", thresholds=thresholds))
+    if use_kalman and df_test_fe is not None:
+        y_pred_kf = _apply_kalman_by_group(
+            y_pred, df_test_fe, time_col=time_col, process_var=kalman_process_var, meas_var=kalman_meas_var
+        )
+        preds_by_model["RandomForest_FE_KF"] = np.asarray(y_pred_kf, dtype=float)
+        rows.append(evaluate_regression(y_test, y_pred_kf, "RandomForest_FE_KF", thresholds=thresholds))
 
     # XGB (x,y)
     xgb_x, xgb_y = train_xgb_xy(X_train, y_train, preproc, xgb_params=dict(_get_cfg(cfg, "xgb_params", {})))
     y_pred = predict_xy_from_xgb(xgb_x, xgb_y, X_test)
+    if use_guardrails and df_test_fe is not None:
+        y_pred = _stabilize_predictions_by_group(
+            y_pred, df_test_fe, time_col=time_col, max_speed_mps=max_speed_mps, max_dt_ms=max_dt_ms
+        )
     preds_by_model["XGBoost_FE"] = np.asarray(y_pred, dtype=float)
     rows.append(evaluate_regression(y_test, y_pred, "XGBoost_FE", thresholds=thresholds))
+    if use_kalman and df_test_fe is not None:
+        y_pred_kf = _apply_kalman_by_group(
+            y_pred, df_test_fe, time_col=time_col, process_var=kalman_process_var, meas_var=kalman_meas_var
+        )
+        preds_by_model["XGBoost_FE_KF"] = np.asarray(y_pred_kf, dtype=float)
+        rows.append(evaluate_regression(y_test, y_pred_kf, "XGBoost_FE_KF", thresholds=thresholds))
 
     results_df = pd.DataFrame(rows).sort_values("median_err_m").reset_index(drop=True)
 
@@ -365,8 +646,8 @@ def prepare_seq_data(
     df_train = add_session_id(df_train)
     df_test = add_session_id(df_test)
 
-    _require_cols(df_train, ["session_id", "device", "motion", "label_X", "label_Y"], "df_train")
-    _require_cols(df_test, ["session_id", "device", "motion", "label_X", "label_Y"], "df_test")
+    _require_cols(df_train, ["session_id", "device", "motion", "segment_id", "label_X", "label_Y"], "df_train")
+    _require_cols(df_test, ["session_id", "device", "motion", "segment_id", "label_X", "label_Y"], "df_test")
 
     # Fit wifi selector on train
     wifi_cols = fit_wifi_selector(
@@ -415,6 +696,37 @@ def prepare_seq_data(
         fill_numeric_with=str(_get_cfg(cfg, "fill_numeric_with", "median")),
         verbose=False,
     )
+
+    # Optional: use only true anchor points as sequence targets to avoid staircase labels from asof-nearest.
+    use_anchor_points = bool(_get_cfg(cfg, "seq_use_anchor_points", True))
+    gap_thr_ms = _get_cfg(cfg, "gap_thr_ms", 1000.0)
+    gap_thr_ms = float(gap_thr_ms) if gap_thr_ms is not None else None
+    min_points = max(20, int(_get_cfg(cfg, "window_size", 20)) * 2)
+
+    def _subset_anchor_points(df_fe: pd.DataFrame, X_num: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if not use_anchor_points:
+            return df_fe, X_num
+        if not {"anchor_X", "anchor_Y"}.issubset(df_fe.columns):
+            return df_fe, X_num
+        m = np.isfinite(df_fe["anchor_X"].to_numpy(dtype=float)) & np.isfinite(df_fe["anchor_Y"].to_numpy(dtype=float))
+        if int(m.sum()) < min_points:
+            return df_fe, X_num
+        d = df_fe.loc[m].copy()
+        x = X_num.loc[m].copy()
+        d["__rid"] = np.arange(len(d), dtype=int)
+        d["label_X"] = d["anchor_X"].astype(float)
+        d["label_Y"] = d["anchor_Y"].astype(float)
+        if {"session_id", "t_ms"}.issubset(d.columns) and gap_thr_ms is not None:
+            d = d.sort_values(["session_id", "t_ms"], kind="mergesort").reset_index(drop=True)
+            x = x.iloc[d["__rid"].to_numpy(dtype=int)].reset_index(drop=True)
+            dt = d.groupby("session_id")["t_ms"].diff()
+            d["segment_id"] = (dt.isna() | (dt > gap_thr_ms)).groupby(d["session_id"]).cumsum().astype(int)
+        d = d.drop(columns=["__rid"]).reset_index(drop=True)
+        x = x.reset_index(drop=True)
+        return d, x
+
+    df_train_fe, X_train_num = _subset_anchor_points(df_train_fe, X_train_num)
+    df_test_fe, X_test_num = _subset_anchor_points(df_test_fe, X_test_num)
 
     # Optional PCA on top correlated numeric features (train-only)
     use_pca = bool(_get_cfg(cfg, "seq_use_pca", False))
@@ -501,51 +813,183 @@ def prepare_seq_data(
             save_joblib(pca, artifact_path("models", "seq_pca", run_id, "joblib"))
 
     # Build tab for OHE
+    time_col = str(_get_cfg(cfg, "time_col", "t_ms"))
+    # Keep a single canonical time column in tabular seq frame (avoid duplicate `t_ms` labels).
+    X_train_num_seq = X_train_num.drop(columns=[time_col], errors="ignore")
+    X_test_num_seq = X_test_num.drop(columns=[time_col], errors="ignore")
+
     train_tab = pd.concat(
         [
-            X_train_num.reset_index(drop=True),
-            df_train_fe[["device", "motion", "session_id", "label_X", "label_Y"]].reset_index(drop=True),
+            X_train_num_seq.reset_index(drop=True),
+            df_train_fe[["device", "motion", "session_id", "segment_id", "label_X", "label_Y", time_col]].reset_index(drop=True),
         ],
         axis=1,
     )
     test_tab = pd.concat(
         [
-            X_test_num.reset_index(drop=True),
-            df_test_fe[["device", "motion", "session_id", "label_X", "label_Y"]].reset_index(drop=True),
+            X_test_num_seq.reset_index(drop=True),
+            df_test_fe[["device", "motion", "session_id", "segment_id", "label_X", "label_Y", time_col]].reset_index(drop=True),
         ],
         axis=1,
     )
 
+    # Optional densification on a regular time grid to increase sequence count.
+    densify_step_ms = _get_cfg(cfg, "seq_densify_step_ms", None)
+    densify_step_ms = int(densify_step_ms) if densify_step_ms is not None else None
+    densify_max_factor = float(_get_cfg(cfg, "seq_densify_max_factor", 4.0))
+
+    def _densify_tab(tab: pd.DataFrame) -> pd.DataFrame:
+        if densify_step_ms is None or densify_step_ms <= 0 or time_col not in tab.columns:
+            return tab
+        parts = []
+        for _, g in tab.groupby(["session_id", "segment_id"], sort=False):
+            g = g.sort_values(time_col, kind="mergesort")
+            if len(g) < 2:
+                parts.append(g)
+                continue
+            t = g[time_col].to_numpy(dtype=float)
+            grid = np.arange(t[0], t[-1] + densify_step_ms, densify_step_ms, dtype=float)
+            if len(grid) <= len(g) or len(grid) > int(np.ceil(len(g) * densify_max_factor)):
+                parts.append(g)
+                continue
+            base = g.set_index(time_col)
+            base = base[~base.index.duplicated(keep="last")]
+            full = base.reindex(base.index.union(grid)).sort_index()
+            num_cols = full.select_dtypes(include=[np.number]).columns.tolist()
+            for c in ("segment_id",):
+                if c in num_cols:
+                    num_cols.remove(c)
+            if num_cols:
+                full[num_cols] = full[num_cols].interpolate(method="index", limit_direction="both")
+            full["session_id"] = g["session_id"].iloc[0]
+            full["segment_id"] = g["segment_id"].iloc[0]
+            full["device"] = g["device"].iloc[0]
+            full["motion"] = g["motion"].iloc[0]
+            out = full.loc[grid].reset_index().rename(columns={"index": time_col})
+            oh_cols = [c for c in out.columns if c.startswith("device_") or c.startswith("motion_")]
+            if oh_cols:
+                out[oh_cols] = (out[oh_cols] >= 0.5).astype(float)
+            parts.append(out)
+        return pd.concat(parts, ignore_index=True).sort_values(["session_id", "segment_id", time_col], kind="mergesort").reset_index(drop=True)
+
+    train_tab = _densify_tab(train_tab)
+    test_tab = _densify_tab(test_tab)
+    df_test_ref = test_tab[["device", "motion", "session_id", "segment_id", "label_X", "label_Y", time_col]].copy()
+
     train_ohe = pd.get_dummies(train_tab, columns=["device", "motion"], drop_first=True)
     test_ohe = pd.get_dummies(test_tab, columns=["device", "motion"], drop_first=True)
-
     # features = all but labels + session_id
-    feature_cols_seq = [c for c in train_ohe.columns if c not in {"label_X", "label_Y", "session_id"}]
+    feature_cols_seq = [c for c in train_ohe.columns if c not in {"label_X", "label_Y", "session_id", "segment_id"}]
+    if not bool(_get_cfg(cfg, "seq_include_time_feature", False)) and time_col in feature_cols_seq:
+        feature_cols_seq = [c for c in feature_cols_seq if c != time_col]
 
     # align test
-    test_ohe = test_ohe.reindex(columns=feature_cols_seq + ["session_id", "label_X", "label_Y"], fill_value=0.0)
+    test_ohe = test_ohe.reindex(
+        columns=feature_cols_seq + ["session_id", "segment_id", "label_X", "label_Y"],
+        fill_value=0.0,
+    )
 
     # sequences
     window_size = int(_get_cfg(cfg, "window_size", 20))
-
+    min_window_size = int(_get_cfg(cfg, "seq_min_window_size", 4))
+    min_test_windows = int(_get_cfg(cfg, "seq_min_test_windows", 80))
+    min_coverage = float(_get_cfg(cfg, "seq_min_coverage", 0.25))
     target_mode = str(_get_cfg(cfg, "seq_target_mode", "abs"))
-    X_train_seqs, y_train_seqs, idx_train = build_sequences(
-        train_ohe,
-        feature_cols_seq,
-        window_size=window_size,
-        session_col="session_id",
-        target_mode=target_mode,
+
+    # Ensure window_size is feasible given segment lengths
+    seg_cols = ["session_id", "segment_id"]
+    if all(c in df_train_fe.columns for c in seg_cols) and all(c in df_test_fe.columns for c in seg_cols):
+        max_train = int(df_train_fe.groupby(seg_cols).size().max())
+        max_test = int(df_test_fe.groupby(seg_cols).size().max())
+        max_allowed = min(max_train, max_test)
+        if max_allowed < window_size:
+            if max_allowed < 2:
+                raise ValueError(
+                    "No sequences built: max segment length is < 2. "
+                    "Increase gap_thr_ms/merge_tolerance_ms or disable strict drops."
+                )
+            window_size = max_allowed
+            print(f"[WARN] window_size reduced to {window_size} (max segment length).")
+
+    max_dt_ms_cfg = _get_cfg(cfg, "seq_max_dt_ms", None)
+    max_dt_ms_cfg = float(max_dt_ms_cfg) if max_dt_ms_cfg is not None else None
+    max_window_ms_cfg = _get_cfg(cfg, "seq_max_window_ms", None)
+    max_window_ms_cfg = float(max_window_ms_cfg) if max_window_ms_cfg is not None else None
+
+    ignore_time_checks = bool(_get_cfg(cfg, "seq_ignore_time_checks", True))
+
+    def _build_for_window(w: int, dt_limit: float | None, win_limit: float | None):
+        xtr, ytr, itr = build_sequences(
+            train_ohe,
+            feature_cols_seq,
+            window_size=w,
+            session_col="session_id",
+            segment_col="segment_id",
+            target_mode=target_mode,
+            time_col=time_col,
+            max_dt_ms=dt_limit,
+            max_window_ms=win_limit,
+            enforce_time_checks=not ignore_time_checks,
+        )
+        xte, yte, ite = build_sequences(
+            test_ohe,
+            feature_cols_seq,
+            window_size=w,
+            session_col="session_id",
+            segment_col="segment_id",
+            target_mode=target_mode,
+            time_col=time_col,
+            max_dt_ms=dt_limit,
+            max_window_ms=win_limit,
+            enforce_time_checks=not ignore_time_checks,
+        )
+        return xtr, ytr, itr, xte, yte, ite
+
+    X_train_seqs, y_train_seqs, idx_train, X_test_seqs, y_test_seqs, idx_test = _build_for_window(
+        window_size, max_dt_ms_cfg, max_window_ms_cfg
     )
-    X_test_seqs, y_test_seqs, idx_test = build_sequences(
-        test_ohe,
-        feature_cols_seq,
-        window_size=window_size,
-        session_col="session_id",
-        target_mode=target_mode,
-    )
+
+    # If too strict, progressively relax constraints and shrink window.
+    n_total_test = int(len(df_test_ref))
+    while True:
+        has_data = (X_train_seqs.size > 0) and (X_test_seqs.size > 0)
+        coverage = (len(idx_test) / max(1, n_total_test))
+        enough_windows = len(idx_test) >= min_test_windows
+        enough_coverage = coverage >= min_coverage
+        if has_data and enough_windows and enough_coverage:
+            break
+
+        relaxed = not (max_dt_ms_cfg is None and max_window_ms_cfg is None)
+        if relaxed:
+            max_dt_ms_cfg = None
+            max_window_ms_cfg = None
+            print("[WARN] Relaxing sequence dt/window constraints to increase coverage.")
+        elif window_size > min_window_size:
+            window_size = max(min_window_size, window_size // 2)
+            print(f"[WARN] Reducing sequence window_size to {window_size} to increase test windows.")
+        else:
+            break
+
+        X_train_seqs, y_train_seqs, idx_train, X_test_seqs, y_test_seqs, idx_test = _build_for_window(
+            window_size, max_dt_ms_cfg, max_window_ms_cfg
+        )
 
     if X_train_seqs.size == 0 or X_test_seqs.size == 0:
-        raise ValueError("No sequences built. Reduce window_size or check sessions lengths.")
+        max_train = int(df_train_fe.groupby(seg_cols).size().max())
+        max_test = int(df_test_fe.groupby(seg_cols).size().max())
+        raise ValueError(
+            "No sequences built. "
+            f"max seg_len train={max_train}, test={max_test}, window_size={window_size}. "
+            "Reduce window_size or increase gap_thr_ms."
+        )
+
+    coverage = len(idx_test) / max(1, n_total_test)
+    if len(idx_test) < min_test_windows or coverage < min_coverage:
+        print(
+            "[WARN] Low sequential coverage after fallback: "
+            f"n_test_windows={len(idx_test)}, coverage={coverage:.3f}, "
+            f"window_size={window_size}. Results may be unstable."
+        )
 
     # scaler fit on train only
     scaler = fit_seq_scaler(X_train_seqs)
@@ -562,6 +1006,8 @@ def prepare_seq_data(
     )
     tr_idx = g_tr.index.to_numpy()
     val_idx = g_val.index.to_numpy()
+    if val_idx.size == 0:
+        val_idx = tr_idx.copy()
 
     # loaders
     batch_size = int(_get_cfg(cfg, "batch_size", 64))
@@ -578,7 +1024,17 @@ def prepare_seq_data(
         save_json({"feature_cols_seq": feature_cols_seq, "window_size": window_size}, p_feat)
         save_joblib(scaler, p_scaler)
         save_npz(p_idx, idx_seq_test=np.asarray(idx_test, dtype=int))
-        save_json({"n_total_test": int(len(df_test_fe))}, p_meta)
+        save_json(
+            {
+                "n_total_test": int(len(df_test_ref)),
+                "n_test_windows": int(len(idx_test)),
+                "coverage": float(coverage),
+                "window_size_effective": int(window_size),
+                "ignore_time_checks": bool(ignore_time_checks),
+                "densify_step_ms": densify_step_ms,
+            },
+            p_meta,
+        )
 
     return {
         "train_loader": train_loader,
@@ -587,9 +1043,14 @@ def prepare_seq_data(
         "scaler_seq": scaler,
         "feature_cols_seq": feature_cols_seq,
         "idx_seq_test": idx_test,
-        "n_total_test": int(len(df_test_fe)),
-        "df_test_fe": df_test_fe.reset_index(drop=True),
+        "n_total_test": int(len(df_test_ref)),
+        "n_test_windows": int(len(idx_test)),
+        "seq_coverage": float(coverage),
+        "window_size_effective": int(window_size),
+        "df_test_fe": df_test_ref.reset_index(drop=True),
         "seq_target_mode": target_mode,
+        "run_id": run_id,
+        "force_recompute": force_recompute,
     }
 
 
@@ -598,8 +1059,8 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
 
     Same note as tabular: signature lacks run_id/force_recompute. We fallback to cfg.run_id/cfg.force_recompute if present.
     """
-    run_id = getattr(cfg, "run_id", None)
-    force_recompute = bool(getattr(cfg, "force_recompute", False))
+    run_id = seq_bundle.get("run_id", getattr(cfg, "run_id", None))
+    force_recompute = bool(seq_bundle.get("force_recompute", getattr(cfg, "force_recompute", False)))
 
     if run_id is not None:
         p_results_pkl = artifact_path("metrics", "results_seq", run_id, "joblib")
@@ -609,6 +1070,15 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
         p_results_pkl = p_results_csv = p_preds = None
 
     thresholds = tuple(_get_cfg(cfg, "thresholds", (0.25, 0.5, 1.0, 2.0)))
+    use_kalman = bool(_get_cfg(cfg, "use_kalman_postproc", True))
+    use_guardrails = bool(_get_cfg(cfg, "use_pred_guardrails", True))
+    time_col = str(_get_cfg(cfg, "time_col", "t_ms"))
+    max_speed_mps = _get_cfg(cfg, "baseline_max_speed_mps", 2.5)
+    max_speed_mps = float(max_speed_mps) if max_speed_mps is not None else None
+    max_dt_ms = _get_cfg(cfg, "gap_thr_ms", 1000.0)
+    max_dt_ms = float(max_dt_ms) if max_dt_ms is not None else None
+    kalman_process_var = float(_get_cfg(cfg, "kalman_process_var", 1e-3))
+    kalman_meas_var = float(_get_cfg(cfg, "kalman_meas_var", 1e-1))
 
     train_loader = seq_bundle["train_loader"]
     val_loader = seq_bundle["val_loader"]
@@ -617,6 +1087,21 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
     n_total_test = seq_bundle["n_total_test"]
     df_test_base = seq_bundle.get("df_test_fe")
     seq_target_mode = str(seq_bundle.get("seq_target_mode", "abs"))
+
+    def _seq_pack(y_true_arr: np.ndarray, y_pred_arr: np.ndarray) -> Dict[str, np.ndarray]:
+        pack: Dict[str, np.ndarray] = {"y_true": y_true_arr, "y_pred": y_pred_arr}
+        if df_test_base is not None:
+            ref = df_test_base.loc[idx_seq_test].reset_index(drop=True)
+            if "t_ms" in ref.columns:
+                pack["t_ms"] = ref["t_ms"].to_numpy(dtype=float)
+            if "session_id" in ref.columns:
+                pack["session_id"] = ref["session_id"].to_numpy()
+            if "segment_id" in ref.columns:
+                pack["segment_id"] = ref["segment_id"].to_numpy()
+            if "anchor_X" in ref.columns and "anchor_Y" in ref.columns:
+                pack["anchor_X"] = ref["anchor_X"].to_numpy(dtype=float)
+                pack["anchor_Y"] = ref["anchor_Y"].to_numpy(dtype=float)
+        return pack
 
     # infer input dim D
     xb0 = next(iter(train_loader))[0]
@@ -627,50 +1112,95 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
     rows = []
     preds_pointwise: Dict[str, np.ndarray] = {}
     preds_seq: Dict[str, Dict[str, np.ndarray]] = {}
+    target_weights = None
+    if seq_target_mode == "delta":
+        y_train_delta = train_loader.dataset.y.detach().cpu().numpy()
+        std_xy = np.std(y_train_delta, axis=0)
+        std_xy = np.maximum(std_xy, 1e-6)
+        inv = 1.0 / std_xy
+        target_weights = inv / np.mean(inv)
 
     # cached metrics + pointwise preds, but still build seq preds if checkpoints exist
     if run_id is not None and (not force_recompute) and all(map(exists, [p_results_pkl, p_preds])):
         metrics_df = load_joblib(p_results_pkl)
         preds_pack = load_npz(p_preds)
         preds_pointwise = _dict_npz_to_preds(preds_pack)
+        bad_shape = any(
+            (np.asarray(v).ndim != 2) or (np.asarray(v).shape[0] != n_total_test) or (np.asarray(v).shape[1] != 2)
+            for v in preds_pointwise.values()
+        )
+        if bad_shape:
+            force_recompute = True
+        else:
+            ckpt_lstm = artifact_path("models", "best_lstm", run_id, "pth")
+            ckpt_gru = artifact_path("models", "best_gru", run_id, "pth")
 
-        ckpt_lstm = artifact_path("models", "best_lstm", run_id, "pth")
-        ckpt_gru = artifact_path("models", "best_gru", run_id, "pth")
+            cache_ok = True
 
-        cache_ok = True
+            if exists(ckpt_lstm):
+                lstm_params = dict(_get_cfg(cfg, "lstm_params", {}))
+                lstm = LSTMRegressorDiamond(input_dim=D, **lstm_params).to(device)
+                try:
+                    lstm.load_state_dict(torch.load(ckpt_lstm, map_location=device, weights_only=True))
+                    y_true, y_pred = predict_torch_model(lstm, test_loader, device)
+                    if seq_target_mode == "delta" and df_test_base is not None:
+                        y_true_pos = df_test_base.loc[idx_seq_test, ["label_X", "label_Y"]].to_numpy(dtype=float)
+                        y_pred_pos = _reconstruct_positions_from_deltas(df_test_base, idx_seq_test, y_pred)
+                        if use_guardrails:
+                            y_pred_pos = _stabilize_predictions_by_group(
+                                y_pred_pos,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                max_speed_mps=max_speed_mps,
+                                max_dt_ms=max_dt_ms,
+                            )
+                        preds_seq["LSTM_FE"] = _seq_pack(y_true_pos, y_pred_pos)
+                    else:
+                        if use_guardrails and df_test_base is not None:
+                            y_pred = _stabilize_predictions_by_group(
+                                y_pred,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                max_speed_mps=max_speed_mps,
+                                max_dt_ms=max_dt_ms,
+                            )
+                        preds_seq["LSTM_FE"] = _seq_pack(y_true, y_pred)
+                except RuntimeError:
+                    cache_ok = False
 
-        if exists(ckpt_lstm):
-            lstm_params = dict(_get_cfg(cfg, "lstm_params", {}))
-            lstm = LSTMRegressorDiamond(input_dim=D, **lstm_params).to(device)
-            try:
-                lstm.load_state_dict(torch.load(ckpt_lstm, map_location=device, weights_only=True))
-                y_true, y_pred = predict_torch_model(lstm, test_loader, device)
-                if seq_target_mode == "delta" and df_test_base is not None:
-                    y_true_pos = df_test_base.loc[idx_seq_test, ["label_X", "label_Y"]].to_numpy(dtype=float)
-                    y_pred_pos = _reconstruct_positions_from_deltas(df_test_base, idx_seq_test, y_pred)
-                    preds_seq["LSTM_FE"] = {"y_true": y_true_pos, "y_pred": y_pred_pos}
-                else:
-                    preds_seq["LSTM_FE"] = {"y_true": y_true, "y_pred": y_pred}
-            except RuntimeError:
-                cache_ok = False
+            if exists(ckpt_gru):
+                gru_params = dict(_get_cfg(cfg, "gru_params", {}))
+                gru = GRURegressorDiamond(input_dim=D, **gru_params).to(device)
+                try:
+                    gru.load_state_dict(torch.load(ckpt_gru, map_location=device, weights_only=True))
+                    y_true, y_pred = predict_torch_model(gru, test_loader, device)
+                    if seq_target_mode == "delta" and df_test_base is not None:
+                        y_true_pos = df_test_base.loc[idx_seq_test, ["label_X", "label_Y"]].to_numpy(dtype=float)
+                        y_pred_pos = _reconstruct_positions_from_deltas(df_test_base, idx_seq_test, y_pred)
+                        if use_guardrails:
+                            y_pred_pos = _stabilize_predictions_by_group(
+                                y_pred_pos,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                max_speed_mps=max_speed_mps,
+                                max_dt_ms=max_dt_ms,
+                            )
+                        preds_seq["GRU_FE"] = _seq_pack(y_true_pos, y_pred_pos)
+                    else:
+                        if use_guardrails and df_test_base is not None:
+                            y_pred = _stabilize_predictions_by_group(
+                                y_pred,
+                                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                                time_col=time_col,
+                                max_speed_mps=max_speed_mps,
+                                max_dt_ms=max_dt_ms,
+                            )
+                        preds_seq["GRU_FE"] = _seq_pack(y_true, y_pred)
+                except RuntimeError:
+                    cache_ok = False
 
-        if exists(ckpt_gru):
-            gru_params = dict(_get_cfg(cfg, "gru_params", {}))
-            gru = GRURegressorDiamond(input_dim=D, **gru_params).to(device)
-            try:
-                gru.load_state_dict(torch.load(ckpt_gru, map_location=device, weights_only=True))
-                y_true, y_pred = predict_torch_model(gru, test_loader, device)
-                if seq_target_mode == "delta" and df_test_base is not None:
-                    y_true_pos = df_test_base.loc[idx_seq_test, ["label_X", "label_Y"]].to_numpy(dtype=float)
-                    y_pred_pos = _reconstruct_positions_from_deltas(df_test_base, idx_seq_test, y_pred)
-                    preds_seq["GRU_FE"] = {"y_true": y_true_pos, "y_pred": y_pred_pos}
-                else:
-                    preds_seq["GRU_FE"] = {"y_true": y_true, "y_pred": y_pred}
-            except RuntimeError:
-                cache_ok = False
-
-        if cache_ok:
-            return metrics_df, preds_pointwise, preds_seq
+            if cache_ok:
+                return metrics_df, preds_pointwise, preds_seq
         # fallback: force recompute if checkpoint dims mismatch
         force_recompute = True
 
@@ -688,18 +1218,46 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
         lr=float(_get_cfg(cfg, "lr", 5e-4)),
         device=device,
         ckpt_path=ckpt_lstm,
+        target_weights=target_weights,
     )
     y_true, y_pred = predict_torch_model(lstm, test_loader, device)
     if seq_target_mode == "delta" and df_test_base is not None:
         y_true_pos = df_test_base.loc[idx_seq_test, ["label_X", "label_Y"]].to_numpy(dtype=float)
         y_pred_pos = _reconstruct_positions_from_deltas(df_test_base, idx_seq_test, y_pred)
+        if use_guardrails:
+            y_pred_pos = _stabilize_predictions_by_group(
+                y_pred_pos,
+                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                time_col=time_col,
+                max_speed_mps=max_speed_mps,
+                max_dt_ms=max_dt_ms,
+            )
         rows.append(evaluate_regression(y_true_pos, y_pred_pos, "LSTM_FE", thresholds=thresholds))
         preds_pointwise["LSTM_FE"] = seq_preds_to_pointwise(y_pred_pos, idx_seq_test, n_total_test, agg="mean")
-        preds_seq["LSTM_FE"] = {"y_true": y_true_pos, "y_pred": y_pred_pos}
+        preds_seq["LSTM_FE"] = _seq_pack(y_true_pos, y_pred_pos)
+        if use_kalman:
+            y_pred_pos_kf = _apply_kalman_by_group(
+                y_pred_pos,
+                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                time_col=time_col,
+                process_var=kalman_process_var,
+                meas_var=kalman_meas_var,
+            )
+            rows.append(evaluate_regression(y_true_pos, y_pred_pos_kf, "LSTM_FE_KF", thresholds=thresholds))
+            preds_pointwise["LSTM_FE_KF"] = seq_preds_to_pointwise(y_pred_pos_kf, idx_seq_test, n_total_test, agg="mean")
+            preds_seq["LSTM_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
     else:
+        if use_guardrails and df_test_base is not None:
+            y_pred = _stabilize_predictions_by_group(
+                y_pred,
+                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                time_col=time_col,
+                max_speed_mps=max_speed_mps,
+                max_dt_ms=max_dt_ms,
+            )
         rows.append(evaluate_regression(y_true, y_pred, "LSTM_FE", thresholds=thresholds))
         preds_pointwise["LSTM_FE"] = seq_preds_to_pointwise(y_pred, idx_seq_test, n_total_test, agg="mean")
-        preds_seq["LSTM_FE"] = {"y_true": y_true, "y_pred": y_pred}
+        preds_seq["LSTM_FE"] = _seq_pack(y_true, y_pred)
 
     # GRU
     gru_params = dict(_get_cfg(cfg, "gru_params", {}))
@@ -711,22 +1269,50 @@ def eval_seq_models(seq_bundle: Dict, *, cfg: Config) -> Tuple[pd.DataFrame, Dic
         train_loader,
         val_loader,
         epochs=int(_get_cfg(cfg, "epochs", 100)),
-        patience=int(_get_cfg(cfg, "patience", 20)),
-        lr=float(_get_cfg(cfg, "lr", 5e-4)),
+        patience=int(_get_cfg(cfg, "gru_patience", int(_get_cfg(cfg, "patience", 20)))),
+        lr=float(_get_cfg(cfg, "gru_lr", float(_get_cfg(cfg, "lr", 5e-4)))),
         device=device,
         ckpt_path=ckpt_gru,
+        target_weights=target_weights,
     )
     y_true, y_pred = predict_torch_model(gru, test_loader, device)
     if seq_target_mode == "delta" and df_test_base is not None:
         y_true_pos = df_test_base.loc[idx_seq_test, ["label_X", "label_Y"]].to_numpy(dtype=float)
         y_pred_pos = _reconstruct_positions_from_deltas(df_test_base, idx_seq_test, y_pred)
+        if use_guardrails:
+            y_pred_pos = _stabilize_predictions_by_group(
+                y_pred_pos,
+                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                time_col=time_col,
+                max_speed_mps=max_speed_mps,
+                max_dt_ms=max_dt_ms,
+            )
         rows.append(evaluate_regression(y_true_pos, y_pred_pos, "GRU_FE", thresholds=thresholds))
         preds_pointwise["GRU_FE"] = seq_preds_to_pointwise(y_pred_pos, idx_seq_test, n_total_test, agg="mean")
-        preds_seq["GRU_FE"] = {"y_true": y_true_pos, "y_pred": y_pred_pos}
+        preds_seq["GRU_FE"] = _seq_pack(y_true_pos, y_pred_pos)
+        if use_kalman:
+            y_pred_pos_kf = _apply_kalman_by_group(
+                y_pred_pos,
+                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                time_col=time_col,
+                process_var=kalman_process_var,
+                meas_var=kalman_meas_var,
+            )
+            rows.append(evaluate_regression(y_true_pos, y_pred_pos_kf, "GRU_FE_KF", thresholds=thresholds))
+            preds_pointwise["GRU_FE_KF"] = seq_preds_to_pointwise(y_pred_pos_kf, idx_seq_test, n_total_test, agg="mean")
+            preds_seq["GRU_FE_KF"] = _seq_pack(y_true_pos, y_pred_pos_kf)
     else:
+        if use_guardrails and df_test_base is not None:
+            y_pred = _stabilize_predictions_by_group(
+                y_pred,
+                df_test_base.loc[idx_seq_test].reset_index(drop=True),
+                time_col=time_col,
+                max_speed_mps=max_speed_mps,
+                max_dt_ms=max_dt_ms,
+            )
         rows.append(evaluate_regression(y_true, y_pred, "GRU_FE", thresholds=thresholds))
         preds_pointwise["GRU_FE"] = seq_preds_to_pointwise(y_pred, idx_seq_test, n_total_test, agg="mean")
-        preds_seq["GRU_FE"] = {"y_true": y_true, "y_pred": y_pred}
+        preds_seq["GRU_FE"] = _seq_pack(y_true, y_pred)
 
     metrics_df = pd.DataFrame(rows).sort_values("median_err_m").reset_index(drop=True)
 
@@ -826,6 +1412,15 @@ def build_and_eval_tabular_cross_device(
     else:
         raise ValueError("model_name must be 'RF' or 'XGB'")
 
+    if bool(_get_cfg(cfg, "use_pred_guardrails", True)):
+        y_pred = _stabilize_predictions_by_group(
+            y_pred,
+            dfB_fe,
+            time_col=str(_get_cfg(cfg, "time_col", "t_ms")),
+            max_speed_mps=float(_get_cfg(cfg, "baseline_max_speed_mps", 2.5)),
+            max_dt_ms=float(_get_cfg(cfg, "gap_thr_ms", 1000.0)),
+        )
+
     metrics = evaluate_regression(yB, y_pred, name=name, thresholds=tuple(_get_cfg(cfg, "thresholds", (0.25, 0.5, 1.0, 2.0))))
 
     t_ms = dfB_fe["t_ms"].to_numpy() if "t_ms" in dfB_fe.columns else None
@@ -838,6 +1433,8 @@ def build_and_eval_tabular_cross_device(
         "y_true": yB,
         "y_pred": np.asarray(y_pred, dtype=float),
         "t_ms": t_ms,
+        "session_id": dfB_fe["session_id"].to_numpy() if "session_id" in dfB_fe.columns else None,
+        "segment_id": dfB_fe["segment_id"].to_numpy() if "segment_id" in dfB_fe.columns else None,
     }
 
 
@@ -856,7 +1453,8 @@ def session_analysis_device_motion(
     """
     _require_cols(df_test_base, ["device", "motion", "label_X", "label_Y"], "df_test_base")
     df = df_test_base.copy().reset_index(drop=True)
-    df["session_id"] = df["device"].astype(str) + "__" + df["motion"].astype(str)
+    if "session_id" not in df.columns:
+        df["session_id"] = df["device"].astype(str) + "__" + df["motion"].astype(str)
 
     y_true_all = df[["label_X", "label_Y"]].to_numpy(dtype=float)
     N = len(df)

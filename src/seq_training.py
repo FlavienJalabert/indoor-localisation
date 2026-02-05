@@ -30,7 +30,12 @@ def build_sequences(
     target_cols: Tuple[str, str] = ("label_X", "label_Y"),
     window_size: int = 20,
     session_col: str | None = None,
+    segment_col: str | None = None,
     target_mode: str = "abs",
+    time_col: str = "t_ms",
+    max_dt_ms: float | None = None,
+    max_window_ms: float | None = None,
+    enforce_time_checks: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     """Create (N, T, D) sequences and (N, 2) targets from dataframe."""
 
@@ -38,20 +43,36 @@ def build_sequences(
     y_seqs: List[np.ndarray] = []
     idx_seq: List[int] = []
 
-    if session_col is not None:
+    if session_col is not None and segment_col is not None and segment_col in df.columns:
+        groups = df.groupby([session_col, segment_col])
+    elif session_col is not None:
         groups = df.groupby(session_col)
     else:
         groups = [(None, df)]
 
     for _, g in groups:
-        if "t_ms" in g.columns:
-            g = g.sort_values("t_ms", kind="mergesort")
+        if time_col in g.columns:
+            g = g.sort_values(time_col, kind="mergesort")
         values = g[feature_cols].values
         y_values = g[list(target_cols)].values if set(target_cols).issubset(g.columns) else None
+        t_values = g[time_col].to_numpy(dtype=float) if time_col in g.columns else None
 
         for i in range(window_size - 1, len(g)):
             start = i - window_size + 1
             end = i + 1
+            if enforce_time_checks and t_values is not None:
+                t_win = t_values[start:end]
+                dt = np.diff(t_win)
+                if dt.size == 0:
+                    continue
+                if not np.all(np.isfinite(dt)):
+                    continue
+                if np.any(dt <= 0):
+                    continue
+                if max_dt_ms is not None and np.max(dt) >= max_dt_ms:
+                    continue
+                if max_window_ms is not None and (t_win[-1] - t_win[0]) >= max_window_ms:
+                    continue
             X_seqs.append(values[start:end])
             if y_values is not None:
                 if target_mode == "delta":
@@ -97,11 +118,17 @@ def train_torch_model(
     lr: float,
     device: torch.device,
     ckpt_path,
+    target_weights: np.ndarray | None = None,
 ) -> dict:
     """Train with early stopping and optional checkpointing."""
 
-    criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    weight_t = None
+    if target_weights is not None:
+        w = np.asarray(target_weights, dtype=np.float32).reshape(1, -1)
+        if w.shape[1] != 2:
+            raise ValueError("target_weights must have shape (2,)")
+        weight_t = torch.tensor(w, dtype=torch.float32, device=device)
 
     history = {"train_loss": [], "val_loss": [], "best_val": float("inf"), "best_epoch": -1}
     epochs_no_improve = 0
@@ -115,7 +142,10 @@ def train_torch_model(
 
             optimizer.zero_grad()
             y_pred = model(X_batch)
-            loss = criterion(y_pred, y_batch)
+            if weight_t is None:
+                loss = torch.mean((y_pred - y_batch) ** 2)
+            else:
+                loss = torch.mean(((y_pred - y_batch) ** 2) * weight_t)
             loss.backward()
             optimizer.step()
 
@@ -130,7 +160,10 @@ def train_torch_model(
                 X_batch = X_batch.to(device)
                 y_batch = y_batch.to(device)
                 y_pred = model(X_batch)
-                loss = criterion(y_pred, y_batch)
+                if weight_t is None:
+                    loss = torch.mean((y_pred - y_batch) ** 2)
+                else:
+                    loss = torch.mean(((y_pred - y_batch) ** 2) * weight_t)
                 val_loss += loss.item() * X_batch.size(0)
 
         val_loss /= len(val_loader.dataset)

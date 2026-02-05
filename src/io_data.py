@@ -32,13 +32,24 @@ def extract_csv_from_zip(zip_bytes: bytes, output_dir: Path) -> List[Path]:
     return csv_paths
 
 
+def _detect_sep(path: Path) -> str:
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        first = f.readline()
+    if ";" in first and "," not in first:
+        return ";"
+    return ","
+
+
 def load_csvs_to_dataframes(csv_paths: List[Path]) -> Dict[str, pd.DataFrame]:
     """Load each CSV into a DataFrame keyed by stem name."""
 
     dfs: Dict[str, pd.DataFrame] = {}
     for path in csv_paths:
+        if path.stem.lower().startswith("fix"):
+            continue
         name_no_ext = path.stem
-        dfs[name_no_ext] = pd.read_csv(path)
+        sep = _detect_sep(path)
+        dfs[name_no_ext] = pd.read_csv(path, sep=sep)
     return dfs
 
 

@@ -160,6 +160,23 @@ def feature_engineering_best(
             df[newc] = _fill_series(df[newc]).fillna(0.0)
             deriv_cols.append(newc)
 
+    # Robust IMU aggregate features: norms + local energy/jerk
+    imu_extra_cols: List[str] = []
+    accel_axes = [c for c in ("AccelX", "AccelY", "AccelZ") if c in df.columns]
+    gyro_axes = [c for c in ("GyroX", "GyroY", "GyroZ") if c in df.columns]
+    mag_axes = [c for c in ("MagnetoX", "MagnetoY", "MagnetoZ") if c in df.columns]
+
+    if accel_axes:
+        df["acc_norm"] = np.sqrt(np.sum(df[accel_axes].to_numpy(dtype=float) ** 2, axis=1))
+        df["acc_jerk"] = (df["acc_norm"].diff() / dt_s).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        imu_extra_cols += ["acc_norm", "acc_jerk"]
+    if gyro_axes:
+        df["gyro_norm"] = np.sqrt(np.sum(df[gyro_axes].to_numpy(dtype=float) ** 2, axis=1))
+        imu_extra_cols += ["gyro_norm"]
+    if mag_axes:
+        df["mag_norm"] = np.sqrt(np.sum(df[mag_axes].to_numpy(dtype=float) ** 2, axis=1))
+        imu_extra_cols += ["mag_norm"]
+
     wifi_all_cols = get_wifi_columns(df, wifi_prefixes)
     if wifi_cols_fixed is None:
         topk_wifi_cols = list(wifi_all_cols)
@@ -171,11 +188,21 @@ def feature_engineering_best(
             if c not in df.columns:
                 df[c] = rssi_missing
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(rssi_missing).astype(float)
+        wifi_mat = df[topk_wifi_cols].to_numpy(dtype=float)
+        df["wifi_mean"] = np.mean(wifi_mat, axis=1)
+        df["wifi_std"] = np.std(wifi_mat, axis=1)
+        df["wifi_max"] = np.max(wifi_mat, axis=1)
+        df["wifi_min"] = np.min(wifi_mat, axis=1)
+        wifi_extra_cols = ["wifi_mean", "wifi_std", "wifi_max", "wifi_min"]
+    else:
+        wifi_extra_cols = []
 
     feature_cols: List[str] = [time_col] + imu_cols_present
     feature_cols += deriv_cols
+    feature_cols += imu_extra_cols
     feature_cols += roll_cols
     feature_cols += topk_wifi_cols
+    feature_cols += wifi_extra_cols
 
     seen = set()
     feature_cols = [c for c in feature_cols if (c in df.columns) and (c not in seen and not seen.add(c))]
@@ -199,8 +226,10 @@ def feature_engineering_best(
         "imu_cols": imu_cols_present,
         "derivative_cols": deriv_cols,
         "roll_cols": roll_cols,
+        "imu_extra_cols": imu_extra_cols,
         "wifi_all_cols_count": len(wifi_all_cols),
         "wifi_topk_cols": topk_wifi_cols,
+        "wifi_extra_cols": wifi_extra_cols,
         "feature_cols_final": feature_cols,
         "nan_total_in_X_fe": nan_total,
         "rolling_window_size": rolling_window_size,
@@ -220,4 +249,3 @@ def feature_engineering_best(
         )
 
     return df, X_fe, y_df, meta, feature_cols
-
